@@ -1,0 +1,3613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频歌曲重命名</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --sidebar: #0b0d11;
+    --panel: #161920;
+    --panel-2: #1c2029;
+    --panel-3: #232833;
+    --border: #262b35;
+    --text: #e6e9ef;
+    --muted: #98a0b0;
+    --faint: #6a7383;
+    --accent: #3b82f6;
+    --accent-soft: #1e3a63;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --radius: 8px;
+    --titlebar-h: 44px;
+
+    /* 浏览器**自己绘制**的部件（滚动条、checkbox 勾选框、input[type=number]
+       的原生三角）要深色，靠这一句。不写它，Chromium 会按系统浅色主题去画，
+       而 CSS 里给控件写 background/color 管不到这些。
+
+       注意：**<select> 的弹出列表不归这一句管** —— 那个列表的底色是从 select
+       自己的 background-color 推的，见下面 `.slotchip select` 那条。
+       曾经以为这一句能一并包住它，结果模板页的下拉列表一直是白底白字。 */
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    overflow: hidden;
+    user-select: none;
+    /* Wails 只在带这个属性的元素（及其后代）上接受文件拖放。
+       放在 body 上 = 整个窗口都能接收。 */
+    --wails-drop-target: drop;
+  }
+
+  svg { display: block; }
+  .hidden { display: none !important; }
+
+  button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background .12s, border-color .12s;
+  }
+  button:hover:not(:disabled) { background: var(--panel-3); border-color: #333a47; }
+  button:disabled { opacity: .38; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #2f6fd8; }
+  button.danger { color: #ffb4ae; border-color: #4a2724; background: #241716; }
+  button.danger:hover:not(:disabled) { background: #331d1b; }
+  button.ghost { background: transparent; border-color: transparent; }
+  button.ghost:hover:not(:disabled) { background: var(--panel-2); }
+  button.icon { padding: 5px 7px; }
+  button.on { background: var(--accent-soft); border-color: #2f5da8; }
+
+  /* ============ 骨架 ============
+     左边一整条到底、顶部是 logo；右边才是标题栏 + 内容。
+     窗口是无边框的（Wails 的 Frameless），「标题栏」就是右边那一行，
+     最小化/最大化/关闭挂在它右端。
+     顶部**不留横线**——少一条线就少一层框。 */
+  .shell { display: flex; height: 100vh; }
+
+  .sidebar {
+    width: 88px;
+    flex: none;
+    background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-bottom: 10px;
+    gap: 3px;
+  }
+  .logo { padding: 14px 0 18px; flex: none; }
+  .logo img { width: 48px; height: 48px; border-radius: 12px; display: block; }
+
+  .nav {
+    width: 68px;
+    flex-direction: column;
+    gap: 5px;
+    padding: 9px 0;
+    background: transparent;
+    border: none;
+    border-left: 2px solid transparent;
+    border-radius: 0 8px 8px 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .nav:hover { background: #12151b; color: var(--text); }
+  .nav.active {
+    background: #141922;
+    border-left-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  .titlebar {
+    flex: none;
+    height: var(--titlebar-h);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-left: 16px;
+    --wails-draggable: drag;
+  }
+  .titlebar-fill { flex: 1; height: 100%; }
+
+  .status {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    --wails-draggable: no-drag;
+  }
+  .status:hover:not(:disabled) { background: var(--panel); border-color: var(--border); }
+  .status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  /* 名称比状态值淡一档，一眼能分清「这是什么」和「它现在怎样」。 */
+  .chip-name { color: var(--faint); }
+  .status.ok .dot { background: var(--ok); }
+  .status.warn .dot { background: var(--warn); }
+  .status.err .dot { background: var(--err); }
+  .status.err { color: #ff9c94; }
+  .status.warn { color: #e3b341; }
+  .status + .status { margin-left: 2px; }
+
+  .wbtns { display: flex; height: 100%; --wails-draggable: no-drag; }
+  .wbtn {
+    width: 46px; height: 100%;
+    border: none; border-radius: 0;
+    background: transparent;
+    color: var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    padding: 0;
+    --wails-draggable: no-drag;
+  }
+  .wbtn:hover { background: #1b1f27; color: var(--text); }
+  .wbtn.close:hover { background: #c0392b; color: #fff; }
+
+  /* ============ 工具条 ============ */
+  .toolbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    flex-wrap: wrap;
+  }
+  /* 任务页顶部的动作条直接坐在视图里，不要自己的左右内边距和底边线 ——
+     否则会和 .view 的内边距叠成两层，看起来就是「套了两层框」。 */
+  .view > .toolbar {
+    padding: 0 0 10px;
+    border-bottom: none;
+    background: transparent;
+  }
+  .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
+  .spacer { flex: 1; }
+
+  select, input[type=text], input[type=number], textarea {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    outline: none;
+    user-select: text;
+  }
+  select { cursor: pointer; padding-right: 6px; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); cursor: pointer; margin: 0; }
+
+  /* 占位符颜色必须显式写。
+     不写就走浏览器默认色（Chrome 是暗灰），压在 #1c2029 上本来就发闷；
+     再叠一层禁用态的透明度，字就彻底没了。 */
+  ::placeholder { color: var(--faint); opacity: 1; }
+
+  /* 禁用态**不要**用 opacity 压整个控件。
+     踩过：User-Agent 关掉开关后整条输入框压到 .5，字几乎看不见 ——
+     而用户恰恰要靠这行占位符知道「留空会用什么」。
+     改成「降背景 + 降边框」，文字保持 ::placeholder 的 --faint 不变：
+     禁用与否由底色和边框表达就够了，没必要拿可读性去换。
+     （文字若跟着变暗，对比度会掉到 3.0:1 附近，属于「运气好才过」。） */
+  input[type=text]:disabled, input[type=number]:disabled,
+  select:disabled, textarea:disabled {
+    background: var(--bg);
+    border-color: #1d222b;
+    color: var(--faint);
+    cursor: not-allowed;
+  }
+
+  .counter { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+  /* ============ 视图 ============ */
+  /* 视图容器。
+     任务页是「工具条 + 表格 + 底部面板」三段式，用纵向 flex，底部面板贴到窗口下沿；
+     模板/记录/设置是单列长页，自己就是滚动容器 —— 不再往里面套一层 .page，
+     少一层就少一层内边距、少一条边线。 */
+  .view { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 12px 14px 0; }
+  .view.scroll { display: block; overflow: auto; padding: 14px; }
+  .grow { flex: 1; }
+
+  .tablewrap {
+    flex: 1; overflow: auto; min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel);
+  }
+
+  /* ============ 进度条 ============ */
+  /* 贴在文件列表的上沿，**不要**悬在工具条和列表中间。
+     踩过：原来是 `height:2px; background:var(--panel-2); margin:8px 0 10px`，
+     静止时就是一条横贯全宽的浅色线（实测 y=105.5..107.5，而工具条 bottom=97.5、
+     列表 top=117.5）——用户报「工具条和列表之间多了一条分割线，面板像被切成两半」。
+     它什么都没表示（进度为 0），却把上面一块区域切开了。
+
+     现在：track 完全透明，静止时一个像素都不画；跑起来才是一条贴着列表上沿的蓝线。
+     -1px 负边距让它压住 .tablewrap 自己的 1px 上边框，两条线合成一条 ——
+     不这么做的话跑起来会看到「2px 蓝线 + 1px 灰线」叠在一起，比原来更糟。 */
+  #progressBar {
+    flex: none;
+    position: relative;        /* 给 z-index 一个生效的前提 */
+    z-index: 2;                /* 压住后面 .tablewrap 的背景和上边框 */
+    height: 2px;
+    margin: 0 0 -1px;
+    background: transparent;
+    border-radius: var(--radius) var(--radius) 0 0;
+    overflow: hidden;
+  }
+  #progressFill {
+    display: block; height: 100%; width: 0;
+    background: var(--accent);
+    transition: width .18s;
+  }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  thead th {
+    position: sticky; top: 0; z-index: 1;
+    text-align: left; font-weight: 500; font-size: 12px; color: var(--muted);
+    background: var(--panel-2); border-bottom: 1px solid var(--border);
+    padding: 8px 10px;
+  }
+  tbody td {
+    padding: 7px 10px;
+    border-bottom: 1px solid #1e222b;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12.5px;
+  }
+  tbody tr:hover { background: #191d25; }
+  tbody tr.selected { background: #17202e; }
+  .c-check { width: 36px; }
+  .c-file { width: 22%; }
+  .c-title { width: 17%; }
+  .c-artist { width: 12%; }
+  .c-new { width: 18%; }
+  .c-status { width: 84px; }
+  .c-progress { width: 84px; }
+  .c-ops { width: 92px; }
+
+  .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+  .muted { color: var(--faint); }
+
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 20px;
+    font-size: 11px; border: 1px solid transparent; white-space: nowrap;
+  }
+  .s-pending { color: var(--faint); border-color: var(--border); }
+  .s-running { color: #79c0ff; border-color: #24405c; background: #121b26; }
+  .s-matched, .s-renamed { color: #7ee787; border-color: #244a2b; background: #121d16; }
+  .s-preview { color: #79c0ff; border-color: #24405c; background: #121b26; }
+  .s-no_match { color: #e3b341; border-color: #47390f; background: #1e1a0f; }
+  .s-failed { color: #ff9c94; border-color: #4a2724; background: #241716; }
+  .s-skipped, .s-canceled { color: var(--faint); border-color: var(--border); }
+
+  .minibar { height: 4px; border-radius: 2px; background: #232833; overflow: hidden; }
+  .minibar i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .minibar i.ok { background: var(--ok); }
+  .minibar i.warn { background: var(--warn); }
+  .minibar i.err { background: var(--err); }
+  .minibar i.mute { background: #4b5563; }
+
+  .ops { display: flex; gap: 5px; }
+  .ops button { padding: 1px 7px; font-size: 11px; }
+
+  .empty {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 10px; color: var(--faint); padding: 40px;
+    border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel);
+  }
+  .empty svg { opacity: .5; }
+  .empty b { color: var(--muted); font-weight: 500; font-size: 14px; }
+  .empty p { margin: 0; font-size: 12px; text-align: center; line-height: 1.7; }
+
+  /* ============ 底部面板 ============ */
+  /* 这里**不要** border-top。
+     上面紧挨着 .tablewrap 的底边，两条线只差 13px，看着就是「中间多了个分割」。
+     日志面板靠背景色和上方圆角自己立住就够了。 */
+  .bottom {
+    flex: none;
+    height: 176px;
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-radius: var(--radius) var(--radius) 0 0;
+    overflow: hidden;
+  }
+  .bottom.collapsed { height: 38px; }
+  .tabs {
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 8px; border-bottom: 1px solid var(--border);
+    flex: none; height: 37px;
+  }
+  .tab {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    border-radius: 0; color: var(--muted); padding: 8px 12px; font-size: 12px;
+  }
+  .tab:hover { background: transparent; color: var(--text); }
+  .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  .pane { flex: 1; overflow: auto; padding: 9px 12px; min-height: 0; user-select: text; }
+  .logline { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; line-height: 1.65; color: var(--muted); }
+  .logline.WARN { color: #e3b341; }
+  .logline.ERROR { color: #ff9c94; }
+  .logline .t { color: #4b5563; }
+  .cmd {
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;
+    line-height: 1.7; word-break: break-all; color: #9ecbff;
+  }
+  .kv { display: grid; grid-template-columns: 92px 1fr; gap: 5px 12px; font-size: 12.5px; }
+  .kv dt { color: var(--faint); }
+  .kv dd { margin: 0; word-break: break-all; user-select: text; }
+
+  /* ============ 两栏工作区（模板页 / 设置页） ============
+     左列放「列表或分组导航」，右列是内容 + 固定底栏。
+     内容区自己滚动，底栏不滚 —— 保存按钮永远在同一个位置，不用滚到底去找。 */
+  .view.ws { flex-direction: row; padding: 0; gap: 0; }
+
+  .ws-nav {
+    width: 236px; flex: none;
+    border-right: 1px solid var(--border);
+    background: #12151b;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .ws-nav-top { flex: none; padding: 12px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .ws-nav-title { color: var(--faint); font-size: 11.5px; padding: 12px 14px 6px; flex: none; }
+  .ws-nav-list {
+    flex: 1; overflow: auto; min-height: 0;
+    padding: 0 8px 12px; display: flex; flex-direction: column; gap: 3px;
+  }
+  .ws-nav-list.flush { padding-top: 4px; }
+
+  .ws-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .ws-scroll { flex: 1; overflow: auto; min-height: 0; padding: 18px 22px 22px; }
+
+  /* ============ 模板页：不要滚动条 ============
+     这一页统共四段，正常窗口尺寸下本来就该一眼看全 —— 结果右边还是挂着一根
+     滚动条。量过（1258×726）：.ws-scroll 的 clientH 630 / scrollH 772，
+     超了 142px，也就是**默认尺寸下就装不下**。所以两处一起动手：
+
+     1) 把纯留白压掉（这一块的 padding、段间距、段标题下边距、段行内边距），
+        量出来省了 91px —— 只压留白，不压字号、不压控件高度，信息量一点不减；
+     2) 剩下的大头在**命名预览自己的行**里：原来是「值一行 + 灰色说明一行」，
+        一组样例 37px、四组连间隔要 188px；改成「标签 | 值 | 说明」一行三列
+        之后一组 19px、四组只要 112px。这一刀就省下 76px。
+
+     加起来 167px > 142px，默认尺寸下真的装得下（不是靠藏滚动条装得像）。
+
+     滚动条本身也一并藏掉：万一用户把窗口拖得比各段 min-height 之和还矮，
+     内容仍要能滚（滚轮/键盘都还能用），但那时候显示一根条只会让人以为界面坏了。
+
+     这些规则全部挂在 #tplScroll 上。设置页共用 .ws-scroll 和 .sect，
+     而那边内容多、真的需要滚动条，不能跟着一起改。 */
+  #tplScroll {
+    padding: 12px 22px 12px;
+    display: flex; flex-direction: column;
+    scrollbar-width: none;
+  }
+  #tplScroll::-webkit-scrollbar { width: 0; height: 0; }
+  #tplScroll > .sect { flex: none; }
+  #tplScroll .sect + .sect { margin-top: 12px; padding-top: 12px; }
+  #tplScroll .sect-head { margin-bottom: 9px; }
+  #tplScroll .slotrow { padding: 7px; gap: 6px; }
+  #tplScroll .hint { margin-top: 6px; }
+  #tplScroll > .sect:last-child {
+    flex: 0 1 auto; min-height: 0;
+    display: flex; flex-direction: column;
+  }
+  /* 预览框**按内容高**，不跟着窗口一起长高。
+     让它 flex:1 填满的话，四行样例底下会空出一大块带边框的白板，像画错了。
+     留白留在它下面的页面底色上，看着才是「内容到这里为止」。
+     flex-shrink 保留：窗口被拖矮时它先缩，缩到 min-height 之后自己内部滚
+     （见 .preview 那条 overflow: auto）。其余三段是 flex: none，不参与收缩。 */
+  #tplScroll > .sect:last-child .preview { flex: 0 1 auto; min-height: 96px; }
+
+  .ws-foot {
+    flex: none;
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .foot-state { color: var(--faint); font-size: 12px; }
+  .foot-state.ok { color: var(--ok); }
+  .foot-state.warn { color: var(--warn); }
+
+  /* 分组。参考图里就是「图标 + 标题 + 右侧说明」一行，下面跟字段网格。
+     没有卡片边框，分组之间只用一条很淡的线分开 —— 再加一层框就又是套娃了。 */
+  .sect + .sect { margin-top: 20px; padding-top: 20px; border-top: 1px solid #1b1f27; }
+  .sect-head { display: flex; align-items: center; gap: 8px; margin-bottom: 13px; }
+  .sect-head > svg { color: var(--accent); flex: none; }
+  .sect-head h3 { margin: 0; font-size: 13px; font-weight: 600; }
+  .sect-note { color: var(--faint); font-size: 11.5px; }
+
+  /* 设置页左列的分组按钮 */
+  .wsg {
+    display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+    padding: 8px 10px;
+    background: transparent; border: 1px solid transparent; border-radius: 8px;
+    color: var(--muted); font-size: 12.5px;
+  }
+  .wsg:hover:not(:disabled) { background: var(--panel); border-color: transparent; color: var(--text); }
+  .wsg.active { background: var(--accent-soft); border-color: #2f5da8; color: #cfe2ff; }
+  .wsg svg { flex: none; }
+
+  /* 搜索框。图标压在输入框里面，不是单独一格。 */
+  .searchbox { position: relative; display: flex; align-items: center; }
+  .searchbox svg { position: absolute; left: 9px; color: var(--faint); pointer-events: none; }
+  .searchbox input { width: 100%; padding-left: 29px; }
+
+  .block { width: 100%; justify-content: center; }
+
+  /* 单列视图的标题行（记录页还在用）。 */
+  .rowhead { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .rowhead b { font-weight: 500; font-size: 13px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 18px; }
+  .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 16px; }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field label { font-size: 11.5px; color: var(--muted); }
+  .field small { color: var(--faint); font-size: 11px; line-height: 1.5; }
+
+  /* ============ 数字输入框的增减按钮 ============ */
+  /* 原生那对小三角是**浏览器按系统主题画的**，CSS 的 background/color 管不到它，
+     在深色页面上是一对浅灰的异物（用户点名提过「增减按钮没规范主题风格」）。
+     所以整个藏掉，换成自己画的一对 − / +（见 enhanceNumberInputs）。
+     藏法用 appearance: textfield —— Chromium / Firefox 都认这一条。 */
+  input[type=number] { appearance: textfield; -moz-appearance: textfield; }
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { appearance: none; margin: 0; }
+
+  /* 包一层是为了把按钮**叠在输入框内部**的右端。
+     不新开一行、不改变 .field 的纵向排布，输入框的 id 和取值逻辑也一点都不动。 */
+  .numwrap { position: relative; display: flex; }
+  /* 右边留出按钮的宽度，否则数字会钻到按钮底下。 */
+  .numwrap input[type=number] { flex: 1; padding-right: 60px; }
+  .numstep {
+    position: absolute; right: 1px; top: 1px; bottom: 1px;
+    display: flex; align-items: stretch;
+    border-left: 1px solid var(--border);
+    border-radius: 0 5px 5px 0;
+    overflow: hidden;
+  }
+  .numstep .numbtn {
+    width: 27px; padding: 0;
+    border: none; border-radius: 0;
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px; line-height: 1;
+    cursor: pointer;
+  }
+  .numstep .numbtn + .numbtn { border-left: 1px solid var(--border); }
+  .numstep .numbtn:hover:not(:disabled) { background: var(--panel-3); color: var(--text); }
+  .numstep .numbtn:active:not(:disabled) { background: var(--accent-soft); color: var(--text); }
+  /* 到顶/到底要看得出来，否则点着没反应像坏了。 */
+  .numstep .numbtn:disabled { color: #3a4150; cursor: default; }
+  /* 输入框整体禁用时，按钮也跟着失去意义。 */
+  .numwrap input[type=number]:disabled + .numstep { opacity: .45; pointer-events: none; }
+  /* 说明文字要自己的类，不能借用 .field —— 那是纵向 flex 容器，
+     套上去之后每个 <code> 和文本节点都会各占一行，整段话竖着排。 */
+  .hint { margin: 10px 0 0; color: var(--faint); font-size: 11.5px; line-height: 1.7; }
+  .hint code, .field label code, .sect-note code {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    color: #9ecbff; background: #10141b;
+    padding: 0 4px; border-radius: 4px;
+  }
+  .full { grid-column: 1 / -1; }
+  .checks { display: flex; gap: 22px; flex-wrap: wrap; }
+  .checks.spaced { margin-top: 14px; }
+  /* 开关项竖着排：每项自带一行说明，横排会挤成两行文字对不齐。 */
+  .stack { display: flex; flex-direction: column; gap: 15px; }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; }
+
+  .row-inline { display: flex; gap: 8px; align-items: center; }
+  .row-inline input[type=text] { flex: 1; min-width: 0; }
+
+  /* 开关。布尔项用滑动开关而不是复选框：一眼能看出「开着还是关着」，
+     复选框在小尺寸下只能靠仔细看那个勾。 */
+  .switch { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+  .switch > input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch > i {
+    width: 36px; height: 20px; border-radius: 10px; flex: none; margin-top: 1px;
+    background: var(--panel-3); border: 1px solid var(--border);
+    position: relative; transition: background .15s, border-color .15s;
+  }
+  .switch > i::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%; background: #8b93a3;
+    transition: transform .15s, background .15s;
+  }
+  .switch > input:checked + i { background: var(--accent); border-color: var(--accent); }
+  .switch > input:checked + i::after { transform: translateX(16px); background: #fff; }
+  .switch > input:focus-visible + i { outline: 2px solid var(--accent-soft); outline-offset: 2px; }
+  .switch > input:disabled + i { opacity: .45; }
+  .switch-text { font-size: 12.5px; }
+  .switch-text small { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; line-height: 1.5; }
+
+  /* 一行「来源 / 状态」，绿色表示真的能用上。 */
+  .src { display: flex; align-items: center; gap: 6px; font-size: 11.5px; margin-top: 6px; color: var(--faint); }
+  .src.ok { color: var(--ok); }
+  .src.warn { color: var(--warn); }
+  .src.err { color: var(--err); }
+  .src svg { flex: none; }
+
+  /* 模板列表项 */
+  .tpl-item {
+    text-align: left; display: block; width: 100%;
+    padding: 8px 10px;
+    background: transparent; border: 1px solid transparent; border-radius: 8px;
+  }
+  .tpl-item:hover:not(:disabled) { background: var(--panel); border-color: transparent; }
+  .tpl-item.on { background: var(--accent-soft); border-color: #2f5da8; }
+  /* b 是块级而不是 flex item：名字过长要出省略号，而 text-overflow 对 inline 无效。
+     （这里原来套了一层 .row1 的 flex 容器，是给右边的「当前」小标让位的；
+     小标撤掉之后容器没有别的用处，一并删了。） */
+  .tpl-item b { display: block; font-weight: 500; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tpl-item.on b { color: #cfe2ff; }
+  .tpl-item code {
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px;
+    color: var(--faint); display: block; margin-top: 3px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tpl-item.on code { color: #8fb4e0; }
+  /* 「现名」那一格上的小标：文件不在记录里的那个名字上，而是在另一个名字上。
+     它证明的是「程序认出了被手动改过名的文件」，不标的话用户看到的是一个
+     磁盘上不存在的文件名，会以为文件没了。 */
+  .moved {
+    margin-left: 6px;
+    font-size: 10px; padding: 0 5px; border-radius: 9px;
+    background: rgba(210, 153, 34, .16); color: #e3b341; border: 1px solid #6b5417;
+    white-space: nowrap;
+  }
+  .tpl-empty { color: var(--faint); font-size: 12px; padding: 10px; }
+
+  /* 命名预览。它是模板页的最后一段，也是**唯一能被压缩**的那一块（见 #tplScroll）。
+     所以这里三件事一起定：
+       · 留白收到最小（11/13 → 9/12，行距 8 → 6），省下的高度全给内容；
+       · overflow: auto —— 窗口被拖矮时，宁可这一块自己内部滚，
+         也不要把整页撑出一根滚动条（那正是用户要求去掉的东西）。
+         它的滚动条同样藏起来：这一块统共三行样例，真滚起来也是滚轮的事。 */
+  .preview {
+    padding: 9px 12px; border-radius: 8px;
+    background: #10141b; border: 1px solid var(--border);
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 12.5px;
+    overflow: auto; scrollbar-width: none;
+  }
+  .preview::-webkit-scrollbar { width: 0; height: 0; }
+  .preview .row { display: flex; gap: 10px; align-items: baseline; }
+  .preview .row + .row { margin-top: 6px; }
+  .preview .k { color: var(--faint); width: 92px; flex: none; }
+  /* 值和说明**并排一行**。
+     原来是上下两行（值一行、下面一行灰色小字），一组样例就是 37px，
+     四组连间隔要 188px —— 模板页装不下、得靠预览自己滚的那 37px 正是从这来的。
+     并排之后一组 19px，四组连间隔一共 112px，还富余。
+     表格本来就是「标签 | 值 | 备注」三列，并排比上下叠着更好扫。 */
+  .preview .cell { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex: 1; }
+  /* 值**不**撑满：撑满会把说明顶到最右边，中间拖出一大片空白。
+     让它按内容宽，说明就紧跟在值后面（「值 说明」连读）。 */
+  .preview .v { color: #9ecbff; word-break: break-all; flex: 0 1 auto; min-width: 0; }
+  .preview .v.warn { color: var(--warn); }
+  /* flex 0 1 auto：说明短就按内容宽，长了可以缩、可以折行 ——
+     写 flex:none 的话它会直接顶破这一行。 */
+  .preview .note { color: var(--faint); font-size: 11px; flex: 0 1 auto; }
+
+  /* ============ 槽位编辑器 ============ */
+  /* ============ 槽位编辑器 ============
+     一行横排的紧凑下拉，末尾一个「+ 添加」。
+     原来是纵向堆叠的高卡片（每张两行、四个控件），选一个位置要动两次手
+     （先选变量再选语种），一屏只放得下三四段。
+     现在一个下拉里直接写「中文歌名」，选一次就到位，一行能放六七段。 */
+  /* 一行一段，竖着排。以前是横排的 chip，段一多就得换行，
+     而每段自己的设置还得折叠起来才放得下。竖排之后设置直接摊开，
+     不用再折叠，也就没有「点开哪一段」这回事了。 */
+  .slotrow {
+    display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--bg);
+    min-height: 48px;
+  }
+  .slotchip {
+    display: flex; align-items: center; flex-wrap: wrap;
+    background: var(--panel-2);
+    /* 左边 3px 是**选中标记**（见下面 focus-within）。
+       常态写成 transparent 而不是 width:0：宽度一直占着，选中时只是换个颜色，
+       整行不会横向抖一下；透明边框底下透出来的是自己的底色，
+       所以看不出这一条的存在，但它顺带把内容从左边推开 4px，不会和行框贴死。 */
+    border: 1px solid var(--border);
+    border-left: 3px solid transparent;
+    border-radius: 7px;
+    /* 拖拽排序的把手就是整行。Chromium 要拖出几个像素才开始 drag，
+       所以单击仍然能正常打开里面的下拉框。 */
+    cursor: grab;
+    transition: background-color .12s, border-color .12s, box-shadow .12s;
+  }
+  .slotchip:active { cursor: grabbing; }
+
+  /* ---- 「这一段被选中」----
+     原来是 `border-color: var(--accent)` 一条：1px 的蓝线在 #0f1115 底上
+     几乎看不出变化（量过：rgb(38,43,53) → rgb(59,130,246)，细得只剩一根丝），
+     用户报的「块选中时样式有问题」就是它。
+     更糟的是同一时刻 chip-fields 里的小输入框也会自己变蓝 ——
+     行框太弱，看上去就只剩「一个和行框错位的小蓝框」，两个框谁也不像选中。
+
+     重做之后，「这一段被选中」**完全由整行承担**，四层一起上：
+       左竖条 3px 强调色，位置固定、不随内容长短变化，一眼认出「是这一行」
+       外框   常态的 #262b35 换成强调色
+       底色   提亮一档并偏蓝，比只换边框明显得多
+       外发光 3px 半透明强调色，把这一行从上下行里"托"起来（行间距 7px，放得下）
+     内层控件一律不画框（见下面），所以不会有第二个蓝框来抢这句话。 */
+  .slotchip:focus-within {
+    background: #1e2637;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, .13);
+  }
+  /* 拖动中经过的落点。竖排之后插到的是这一行的**上方**，
+     所以用顶部一条内阴影表示，比整块高亮精确。
+     外发光这里要再写一遍：box-shadow 不是叠加的，不写就被 focus-within 那条顶掉，
+     而拖拽时拖把常常还带着焦点。 */
+  .slotchip.over {
+    border-color: var(--accent);
+    box-shadow: inset 0 3px 0 var(--accent), 0 0 0 3px rgba(59, 130, 246, .13);
+  }
+  .slotchip.dragging { opacity: .45; }
+  /* 行里的控件都去掉自己的框，让整行看起来是一个整体。
+     全局的 `input:focus { border-color: var(--accent) }` 在这里会画出一个
+     和行框错位的小框，所以显式压掉 —— 选中反馈交给 .slotchip:focus-within。 */
+  .slotchip select,
+  .slotchip input {
+    border: none; border-radius: 0;
+    padding: 5px 4px 5px 9px;
+    font-size: 12.5px; color: var(--text);
+    outline: none;
+  }
+
+  /* 「这一段放什么」的下拉、以及它右边的「固定文字」输入框：
+     给一块**凹**下去的底（比行底色深一档），静态就能看出「这块能点 / 能打字」。
+     原来两个都是完全透明的裸文字，用户根本不知道能点 ——
+     这是第 3 条的另一半：不光选中态弱，连「可交互」都没表达出来。
+
+     用 `>` 只圈住直接子元素。.chip-fields 里那几个小控件有自己的框和底色，
+     被这里顺手改掉的话，一行里就会同时出现两种不同深浅的控件底。
+
+     底色必须是**实心**的，不能写 transparent：
+     踩过的坑：Chromium 画选项列表时，列表底色是从 select 自己的
+     background-color 推的。透明就推不出颜色，于是退回系统浅色默认值 ——
+     白底，而选项文字继承的是这里的 color（浅色），结果是白底白字，几乎看不见。
+     这跟 color-scheme 无关：:root 上写了 dark 也救不了它，因为那是两套机制。
+     也不再写 inherit：inherit 会跟着 focus-within 的行底色一起浮起来，
+     「凹」的意思就没了。 */
+  .slotchip > select {
+    background-color: #171b25;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .slotchip > select:hover { background-color: #202634; }
+  /* 固定文字那格。原来透明，看不出这 88px 是能打字的区域，
+     文字长了被截断也没有个边界提示。给它同一块凹槽，和左边的下拉连成一组。 */
+  .slotchip > input {
+    background-color: #171b25;
+    border-radius: 5px;
+    width: 88px;
+    padding-left: 8px; padding-right: 8px;
+    cursor: text;
+  }
+  /* 光标在哪：只把**那一个**控件的底色再提亮一档。不画框 ——
+     画框就会和行框错位，那就是用户报的那个毛病。
+
+     这条也必须收成 `>`。原来写成后代选择器 `.slotchip select:focus { border: none }`，
+     它会连 chip-fields 里那几个小控件一起命中：`border: none` 把 border-style
+     一起清成了 none，而下面 `.chip-fields ... :focus { border-color }` 只改颜色、
+     改不回样式 —— 结果就是**一点进「分隔符」那个小框，它的边框直接消失**，
+     看着像框缺了一块。现在小框聚焦时保住边框、只是变蓝。 */
+  .slotchip > select:focus,
+  .slotchip > input:focus { background-color: #26304a; border: none; }
+  /* 删除按钮推到最右边（margin-left: auto），一行看起来才收得住口。 */
+  .slotchip .chip-x {
+    margin-left: auto;
+    background: transparent; border: none; border-radius: 0;
+    color: var(--faint); font-size: 13px; line-height: 1;
+    padding: 4px 9px 4px 2px;
+  }
+  .slotchip .chip-x:hover:not(:disabled) { background: transparent; color: var(--err); }
+  .slot-add {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 7px;
+    color: var(--muted);
+    padding: 5px 10px; font-size: 12.5px;
+  }
+  .slot-add:hover:not(:disabled) { border-color: var(--accent); color: var(--text); background: transparent; }
+  .slotrow .tpl-empty { padding: 4px 2px; }
+
+  /* 模板页那个裸输入框的宽度。
+     不写的话它就是浏览器默认的 165px，而分隔符只有一两个字符，
+     铺满反而空得难看。 */
+  #tplSep { width: 140px; }
+
+  /* ============ 每一段自己的「分隔符 / 前缀 / 后缀」 ============
+     这三项摊在段自己那一行里，左侧一条竖线把它和「这一段放什么」分开。 */
+  .chip-fields {
+    display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+    margin-left: 5px; padding-left: 10px;
+    border-left: 1px solid var(--border);
+    color: var(--faint); font-size: 11.5px;
+  }
+  /* 覆盖 .slotchip input 的 88px —— 那是「固定文字」用的宽度，这里要窄一些。 */
+  .chip-fields input { width: 74px; }
+  /* 分隔符就一两个字符，跟前缀后缀一样宽会显得空。 */
+  .chip-fields input.sep { width: 52px; }
+
+  /* 这三个控件得把框要回来。
+     上面把行里所有 select / input 的边框都压掉了，那是为了「整行看着是一体」；
+     但补充设置是嵌在里面的一小片区域，跟着一起无框的话：
+     「跟随全局」看着像一个加粗的标签，前缀后缀的「可选」看着像正文 ——
+     用户根本不知道这三处能点、能改。
+     底色用 --bg（比行的 --panel-2 深），正好凹进去一块，像行里的小抽屉。 */
+  .chip-fields select,
+  .chip-fields input {
+    background-color: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 4px 3px 6px;
+    font-size: 11.5px;
+  }
+  /* 覆盖上面那条 `.slotchip select:focus { border: none }`（同权重，这里在后）。 */
+  .chip-fields select:focus,
+  .chip-fields input:focus { border-color: var(--accent); }
+
+  .hist { width: 100%; border-collapse: collapse; }
+  .hist th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  .hist td { padding: 7px 10px; border-bottom: 1px solid #1e222b; font-size: 12.5px; }
+  .hist tr:hover { background: #191d25; }
+  /* 行内那颗「还原」按钮：表格里要小一号，否则每行都被撑高。
+     全局 button 是 5px 10px，对一行 12.5px 的文字来说太胖了。 */
+  .hist button { padding: 1px 9px; font-size: 11.5px; }
+
+  /* 勾选框那一列。默认的单元格 padding 会把一个 13px 的方框撑成
+     一格 36px 宽、左边还空一截的样子，收窄一点。 */
+  .hist td:first-child, .hist th:first-child { padding-left: 12px; }
+  /* 勾不了的（已还原 / 现名不在）要一眼看出勾不了。
+     不压暗的话它和「还没勾」长得一模一样，用户点它没反应会以为界面卡了。 */
+  .hist input[type=checkbox]:disabled { opacity: .35; cursor: not-allowed; }
+
+  /* 记录页的搜索 / 筛选 / 批量还原那一行。
+     单独占一行，不塞进上面的标题行：标题行右边已经有「导出」「刷新」「撤销全部」
+     三颗按钮，再挤进一个搜索框和一个下拉，窄窗口下会折成两层，看着像排版坏了。 */
+  .histbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  /* 搜索框给个上限。铺满整行的话它右边会空出一大片，
+     而「还原所选」被推到窗口最右边，跟它要操作的那张表离得太远。 */
+  .histsearch { width: 280px; }
+  .histcount { color: var(--faint); font-size: 12px; }
+
+  /* ============ 确认弹窗 ============
+     WebView 原生的 confirm() 是浅色的系统对话框，在这套深色界面里像另一个程序弹出来的。
+     自己画一个：遮罩 + 卡片，危险操作的确认按钮走红色。 */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 300;
+    background: rgba(8, 10, 14, .62);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .modal {
+    width: 100%; max-width: 396px;
+    background: var(--panel);
+    border: 1px solid #2e3440;
+    border-radius: 12px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .55);
+    overflow: hidden;
+  }
+  .modal-head { display: flex; align-items: center; gap: 9px; padding: 16px 18px 0; }
+  .modal-head svg { flex: none; }
+  .modal-head h3 { margin: 0; font-size: 13.5px; font-weight: 600; }
+  .modal-body {
+    padding: 9px 18px 2px;
+    color: var(--muted); font-size: 12.5px; line-height: 1.75;
+    white-space: pre-line; user-select: text;
+  }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 18px; }
+  .modal-foot button { min-width: 78px; justify-content: center; }
+  /* askInput 用的那一行输入框。单独一块而不是塞进 .modal-body：
+     正文是 textContent 直接赋的，输入框在里面会被下一次赋值抹掉。 */
+  .modal-field { padding: 12px 18px 2px; }
+  .modal-field input { width: 100%; }
+
+  /* ============ 右键菜单 ============
+     模板列表上的重命名 / 复制 / 删除。用自绘菜单而不是 WebView 原生的 ——
+     原生那份是浅色系统样式，从这套深色界面里弹出来像另一个程序，
+     而且原生菜单在 Wails 的无边框窗口里还会被窗口边界裁掉。 */
+  .ctxmenu {
+    position: fixed; z-index: 320;
+    min-width: 132px; padding: 5px;
+    background: var(--panel);
+    border: 1px solid #2e3440; border-radius: 8px;
+    box-shadow: 0 14px 36px rgba(0, 0, 0, .55);
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .ctxmenu button {
+    justify-content: flex-start;
+    background: transparent; border: none; border-radius: 5px;
+    padding: 6px 9px; font-size: 12.5px; color: var(--text);
+    text-align: left;
+  }
+  .ctxmenu button:hover:not(:disabled) { background: var(--panel-2); }
+  .ctxmenu button.danger { color: var(--err); }
+  .ctxmenu button.danger:hover:not(:disabled) { background: rgba(248, 81, 73, .12); }
+  .ctxmenu hr { margin: 4px 6px; border: none; border-top: 1px solid var(--border); }
+
+  /* ============ 拖放提示 ============ */
+  .dropzone {
+    position: fixed; inset: 0; z-index: 200;
+    display: none;
+    align-items: center; justify-content: center;
+    background: rgba(15, 17, 21, .86);
+    border: 2px dashed var(--accent);
+    font-size: 15px; color: #9ecbff;
+    pointer-events: none;
+  }
+  .dropzone.on { display: flex; }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- 左边一整条到底：顶部是 logo，下面是导航。没有顶部横线。 -->
+  <aside class="sidebar">
+    <div class="logo"><img src="/icon.png" alt=""></div>
+
+    <button class="nav active" data-view="tasks">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      <span>任务</span>
+    </button>
+    <button class="nav" data-view="templates">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h10l6 6v8a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/><path d="M14 5v6h6"/></svg>
+      <span>模板</span>
+    </button>
+    <button class="nav" data-view="history">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg>
+      <span>记录</span>
+    </button>
+    <button class="nav" data-view="settings">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2.5l1.6 2.6 3-.5.3 3 2.6 1.5-1.6 2.6 1.6 2.6-2.6 1.5-.3 3-3-.5L12 21.5l-1.6-2.6-3 .5-.3-3-2.6-1.5L6.1 12 4.5 9.4l2.6-1.5.3-3 3 .5z"/></svg>
+      <span>设置</span>
+    </button>
+  </aside>
+
+  <div class="main">
+
+    <!-- 标题栏。系统框架已关掉（Frameless），这一条就是窗口的外框。
+         左端常驻「识别程序 / ffmpeg」两个状态，点一下重新自检。 -->
+    <header class="titlebar" id="titlebar">
+      <!-- 名称是固定标签，右边的值才是状态。
+           分开写是因为 shazam-sidecar 的 --env 只报版本号（"0.1.0"），
+           名称是产品自己的一部分，不该指望子进程把它拼进来。 -->
+      <button class="status" id="chipSidecar" title="点一下重新自检">
+        <i class="dot"></i><span class="chip-name">shazam-sidecar</span><span id="chipSidecarText">检测中…</span>
+      </button>
+      <button class="status" id="chipFFmpeg" title="点一下重新自检">
+        <i class="dot"></i><span class="chip-name">ffmpeg</span><span id="chipFFmpegText">检测中…</span>
+      </button>
+
+      <div class="titlebar-fill"></div>
+      <div class="wbtns">
+        <button class="wbtn" id="winMin" title="最小化">
+          <svg width="10" height="10" viewBox="0 0 10 10" shape-rendering="crispEdges">
+            <path d="M0 5h10" stroke="currentColor" stroke-width="1"/>
+          </svg>
+        </button>
+        <button class="wbtn" id="winMax" title="最大化">
+          <svg id="iconMax" width="10" height="10" viewBox="0 0 10 10" fill="none" shape-rendering="crispEdges">
+            <rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" stroke-width="1"/>
+          </svg>
+          <svg id="iconRestore" class="hidden" width="10" height="10" viewBox="0 0 10 10" fill="none" shape-rendering="crispEdges">
+            <path d="M2.5 2.5V0.5h7v7h-2" stroke="currentColor" stroke-width="1"/>
+            <rect x="0.5" y="2.5" width="7" height="7" stroke="currentColor" stroke-width="1"/>
+          </svg>
+        </button>
+        <button class="wbtn close" id="winClose" title="关闭">
+          <svg width="10" height="10" viewBox="0 0 10 10" shape-rendering="crispEdges">
+            <path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" stroke-width="1"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+      <!-- ============ 任务视图 ============ -->
+      <div id="view-tasks" class="view">
+        <div class="toolbar">
+          <button id="btnAddFiles">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            添加文件
+          </button>
+          <button id="btnAddFolder">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>
+            添加文件夹
+          </button>
+          <select id="selTemplate" title="命名模板"></select>
+          <select id="selStatus" title="按状态筛选"></select>
+          <div class="spacer"></div>
+          <button id="btnStart" class="primary">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4l13 8-13 8z"/></svg>
+            开始
+          </button>
+          <button id="btnPause" disabled>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4h4v16H7zM13 4h4v16h-4z"/></svg>
+            <span id="btnPauseLabel">暂停</span>
+          </button>
+          <button id="btnStop" class="danger" disabled>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+            停止
+          </button>
+          <div class="sep"></div>
+          <span id="counter" class="counter">0 个任务</span>
+          <select id="selSize" title="按文件大小筛选"></select>
+          <button id="btnRemove" class="ghost hidden" title="把选中的条目移出队列">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
+            移除所选
+          </button>
+          <button id="btnClear" class="ghost" title="清空队列（不删磁盘上的文件）">清空</button>
+          <button id="btnRescan" class="icon ghost" title="重新扫描当前目录">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+          </button>
+        </div>
+
+        <!-- 进度条贴在文件列表的上沿，**不是**浮在工具条和列表之间。
+             见下面 #progressBar 的样式注释：原来那条 margin:8px 0 10px 的
+             浅色 track 横贯全宽，看着就是「工具条和列表之间多了一条分割线」。 -->
+        <div id="progressBar">
+          <i id="progressFill"></i>
+        </div>
+
+        <div class="tablewrap grow" id="tablewrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="c-check"><input type="checkbox" id="checkAll"></th>
+                <th class="c-file">文件</th>
+                <th class="c-title">歌名</th>
+                <th class="c-artist">艺人</th>
+                <th class="c-new">新文件名</th>
+                <th class="c-status">状态</th>
+                <th class="c-progress">进度</th>
+                <th class="c-ops">操作</th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty grow">
+          <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 10.5l4 1.5-4 1.5z" fill="currentColor" stroke="none"/></svg>
+          <b>队列里还没有文件</b>
+          <p>点「添加文件」「添加文件夹」，或者把音乐/视频直接拖进窗口。<br>拖文件夹会递归找里面的媒体文件；其他类型自动过滤掉。</p>
+        </div>
+
+        <div class="bottom" id="bottom">
+          <div class="tabs">
+            <button class="tab on" data-pane="log">输出日志</button>
+            <button class="tab" data-pane="detail">处理详情</button>
+            <button class="tab" data-pane="command">命令预览</button>
+            <div class="spacer"></div>
+            <button class="icon ghost" id="btnToggleBottom" title="折叠 / 展开">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>
+            </button>
+          </div>
+          <div class="pane" id="pane-log"></div>
+          <div class="pane hidden" id="pane-detail">
+            <div class="kv" id="detailBody"><dt>—</dt><dd>选中一行后在这里看详情</dd></div>
+          </div>
+          <div class="pane hidden" id="pane-command">
+            <div class="cmd" id="commandBody">选中一行后在这里看会执行的那条命令。</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 模板视图 ============ -->
+      <!-- ============ 模板视图 ============
+           左列是模板列表，右列是编辑表单，保存固定在右下角。 -->
+      <div id="view-templates" class="view ws hidden">
+        <aside class="ws-nav">
+          <div class="ws-nav-top">
+            <div class="searchbox">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+              <input type="text" id="tplSearch" spellcheck="false" placeholder="搜索模板">
+            </div>
+            <button id="btnNewTemplate" class="primary block">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              新建模板
+            </button>
+          </div>
+          <div class="ws-nav-list" id="tplList"></div>
+        </aside>
+
+        <section class="ws-main">
+          <!-- id 是给 CSS 用的：设置页也共用 .ws-scroll，但那边内容多、
+               真的需要一根滚动条，所以模板页的「不出滚动条」只能单独针对它。 -->
+          <div class="ws-scroll" id="tplScroll">
+
+            <section class="sect">
+              <header class="sect-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h16M4 16h10"/></svg>
+                <h3>分隔符</h3>
+                <div class="spacer"></div>
+                <span class="sect-note" id="tplKind">—</span>
+              </header>
+              <!-- 段与段之间插什么。以前旁边有一排 `-` `_` `.` 的快捷按钮，
+                   撤掉了：全角符号用输入法打得出，而那一排既占地方又得跟后端对清单。 -->
+              <input type="text" id="tplSep" spellcheck="false"
+                     aria-label="分隔符" placeholder=" - ">
+            </section>
+
+            <section class="sect">
+              <header class="sect-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h5l2 2h9v10H4z"/><path d="M9 13h6"/></svg>
+                <h3>命名</h3>
+                <div class="spacer"></div>
+                <span class="sect-note">从上到下即顺序，可拖动排序</span>
+              </header>
+              <!-- 一行一段，每段的「分隔符 / 前缀 / 后缀」就摊在它自己这一行里，
+                   不再折叠。折叠的代价是：想知道某一段设了什么，得先点开它；
+                   而这一页本来就是用来一眼看全的。 -->
+              <div class="slotrow" id="slotList">
+                <button id="btnAddSlot" class="slot-add">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                  添加
+                </button>
+              </div>
+              <p class="hint">取不到值的那段会整段消失，连它前面的分隔符一起。</p>
+            </section>
+
+            <section class="sect">
+              <header class="sect-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9.5v4M12 17h.01"/><path d="M10.3 3.9 2.5 17.4A1.8 1.8 0 0 0 4 20h16a1.8 1.8 0 0 0 1.5-2.6L13.7 3.9a1.8 1.8 0 0 0-3.4 0z"/></svg>
+                <h3>未识别命名</h3>
+                <div class="spacer"></div>
+                <span class="sect-note">标记 + 原文件名</span>
+              </header>
+              <div class="grid3">
+                <div class="field">
+                  <label for="tplPrefix">前缀</label>
+                  <input type="text" id="tplPrefix" placeholder="0_">
+                </div>
+                <div class="field">
+                  <label for="tplSuffix">后缀</label>
+                  <input type="text" id="tplSuffix" placeholder="留空">
+                </div>
+                <div class="field">
+                  <label for="tplMaxRunes">名字长度上限（字符）</label>
+                  <input type="number" id="tplMaxRunes" min="16" max="200">
+                </div>
+              </div>
+            </section>
+
+            <!-- 预览放在最下面：它是「上面这些设置的结果」，放在中间会把
+                 「改哪儿」和「看什么」隔开。 -->
+            <section class="sect">
+              <header class="sect-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h10l6 6v8a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/><path d="M14 5v6h6"/></svg>
+                <h3>命名预览</h3>
+                <div class="spacer"></div>
+                <span class="sect-note">样例试算，不碰磁盘</span>
+              </header>
+              <div class="preview" id="tplPreview"></div>
+            </section>
+
+            <!-- 「多语种标题」整块删掉了。
+                 它原来是让用户手填一串 zh-CN/CN、ko-KR/KR，前提是用户得自己记住
+                 「模板里写了 {title:ko}，就得把韩文填进去」。这两件事本来就该绑在一起，
+                 拆开设只会漏填 —— 而漏填是**静默失效**：那一格永远取不到值、
+                 在预览里安静地消失，看起来就像「这首歌本来就没有韩文名」。
+                 现在由模板里的语种自动推导，见 naming.ExtraLocales。 -->
+
+          </div>
+
+          <!-- 底栏只剩保存。名称（含重命名 / 复制 / 删除）挪到左边列表的右键菜单里，
+               「恢复内置模板」和「设为当前」按 Majo 的要求撤掉了 ——
+               用哪份模板由任务页那颗下拉现场决定，模板页不需要再放一个开关。 -->
+          <footer class="ws-foot">
+            <span class="foot-state" id="tplState">—</span>
+            <div class="spacer"></div>
+            <button id="btnSaveTemplate" class="primary">保存</button>
+          </footer>
+        </section>
+      </div>
+
+      <!-- ============ 记录视图 ============ -->
+      <!-- 这一页的用处就是「记住每个文件原来叫什么」。
+           所以还原过的条目**不删**，只是标成「已还原」——删掉等于没记过。 -->
+      <div id="view-history" class="view hidden">
+        <div class="rowhead">
+          <b>改名记录</b>
+          <div class="spacer"></div>
+          <button id="btnExport">导出识别结果 CSV</button>
+          <button id="btnRefreshHistory" class="icon ghost" title="刷新">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button id="btnUndoAll" class="danger">撤销全部改名</button>
+        </div>
+
+        <!-- 搜索 / 筛选 / 批量还原。
+             筛选和搜索只改「看得见哪些」，不改记录本身；
+             「还原所选」只认勾上的那些，跟筛选条件无关。 -->
+        <div class="histbar">
+          <div class="searchbox histsearch">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+            <input type="text" id="histSearch" spellcheck="false" aria-label="搜索记录"
+                   placeholder="搜索文件名或路径">
+          </div>
+          <select id="histFilter" aria-label="筛选记录">
+            <option value="all">全部</option>
+            <option value="undoable">可还原</option>
+            <option value="restored">已还原</option>
+            <option value="missing">已不在</option>
+          </select>
+          <div class="spacer"></div>
+          <span class="histcount" id="histCount">—</span>
+          <!-- 「一键还原」不弹确认：勾哪几条本身就是确认，
+               而且勾选一变就会重算这个数字，按下去之前用户一定看得到会动几个。
+               真正无边界的那颗「撤销全部改名」才需要确认。 -->
+          <button id="btnUndoSelected" disabled>还原所选</button>
+        </div>
+
+        <div class="tablewrap grow" id="histWrap" style="margin-bottom:14px">
+          <table class="hist">
+            <thead>
+              <tr>
+                <th style="width:36px"><input type="checkbox" id="histAll" title="全选当前筛出来的可还原项"></th>
+                <th style="width:150px">时间</th><th>原名</th><th>现名</th><th style="width:82px">状态</th><th style="width:70px"></th>
+              </tr>
+            </thead>
+            <tbody id="histBody"></tbody>
+          </table>
+        </div>
+        <!-- 空状态分两句说：「一条都没有」和「筛掉了」。
+             混成一句的话，用户打错一个字会以为记录被清空了。 -->
+        <div id="histEmpty" class="empty grow" style="margin-bottom:14px">
+          <b id="histEmptyTitle">还没有改名记录</b>
+          <p id="histEmptyNote">每次改名都会记一行，撤销就是照这份记录倒着改回去。</p>
+        </div>
+      </div>
+
+      <!-- ============ 设置视图 ============ -->
+      <!-- ============ 设置视图 ============
+           左列按分组排，点一下切右列的内容；保存固定在右下角。 -->
+      <div id="view-settings" class="view ws hidden">
+        <aside class="ws-nav">
+          <div class="ws-nav-title">设置分组</div>
+          <div class="ws-nav-list flush" id="setNav">
+            <button class="wsg active" data-group="recognize">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+              <span>识别</span>
+            </button>
+            <button class="wsg" data-group="scan">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+              <span>扫描范围</span>
+            </button>
+            <button class="wsg" data-group="ffmpeg">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M7 9.5l3 2.5-3 2.5z"/><path d="M13 15h4"/></svg>
+              <span>FFmpeg 程序</span>
+            </button>
+            <button class="wsg" data-group="window">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/></svg>
+              <span>窗口与后台</span>
+            </button>
+            <button class="wsg" data-group="network">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
+              <span>网络</span>
+            </button>
+            <button class="wsg" data-group="files">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h6l2 2h8v12H4z"/><path d="M4 11h16"/></svg>
+              <span>文件位置</span>
+            </button>
+          </div>
+        </aside>
+
+        <section class="ws-main">
+          <div class="ws-scroll" id="setScroll">
+
+            <div class="set-group" data-group="recognize">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+                  <h3>识别参数</h3>
+                  <div class="spacer"></div>
+                </header>
+                <div class="grid3">
+                  <div class="field">
+                    <label for="cfgSegment">取样窗口（秒）</label>
+                    <input type="number" id="cfgSegment" min="1" max="14">
+                    <small>默认 12。Shazam 对 ≥15 秒的片段一律返回空结果。</small>
+                  </div>
+                  <div class="field">
+                    <label for="cfgConcurrency">并发数</label>
+                    <input type="number" id="cfgConcurrency" min="1" max="16">
+                    <small>同时识别几个文件。调太高容易被限流。</small>
+                  </div>
+                  <div class="field">
+                    <label for="cfgRetries">失败重试次数</label>
+                    <input type="number" id="cfgRetries" min="0" max="10">
+                    <small>只对网络类错误重试。</small>
+                  </div>
+                </div>
+                <div class="grid3" style="margin-top:14px">
+                  <div class="field">
+                    <label for="cfgTimeout">单次超时（秒）</label>
+                    <input type="number" id="cfgTimeout" min="5" max="300">
+                  </div>
+                  <div class="field">
+                    <label for="cfgLanguage">首选语言</label>
+                    <input type="text" id="cfgLanguage" placeholder="en-US">
+                    <small>决定第一次查询用哪个 storefront。</small>
+                  </div>
+                  <div class="field">
+                    <label for="cfgCountry">首选国家代码</label>
+                    <input type="text" id="cfgCountry" placeholder="US">
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="set-group hidden" data-group="scan">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                  <h3>扫描范围</h3>
+                  <div class="spacer"></div>
+                  <span class="sect-note">拖进来的文件也按这份清单过滤</span>
+                </header>
+                <div class="field">
+                  <label for="cfgExtensions">媒体扩展名</label>
+                  <textarea id="cfgExtensions" spellcheck="false" rows="3"></textarea>
+                  <small>用逗号分隔，带不带点都行。</small>
+                </div>
+                <div class="stack" style="margin-top:16px">
+                  <label class="switch">
+                    <input type="checkbox" id="cfgRecursive"><i></i>
+                    <span class="switch-text">处理子目录</span>
+                  </label>
+                  <label class="switch">
+                    <input type="checkbox" id="cfgSkip"><i></i>
+                    <span class="switch-text">跳过已处理过的文件<small>已经识别过的文件不再重复识别。</small></span>
+                  </label>
+                  <label class="switch">
+                    <input type="checkbox" id="cfgDryRun"><i></i>
+                    <span class="switch-text">预览模式<small>只算新名字，不改磁盘上的文件。</small></span>
+                  </label>
+                </div>
+              </section>
+            </div>
+
+            <div class="set-group hidden" data-group="ffmpeg">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M7 9.5l3 2.5-3 2.5z"/><path d="M13 15h4"/></svg>
+                  <h3>可执行文件</h3>
+                  <div class="spacer"></div>
+                  <button id="btnRedetect" class="ghost">重新检测</button>
+                </header>
+                <div class="field">
+                  <label for="cfgFFmpeg">ffmpeg 路径</label>
+                  <div class="row-inline">
+                    <input type="text" id="cfgFFmpeg" spellcheck="false" placeholder="留空则自动从系统 PATH 中查找">
+                    <button id="btnPickFFmpeg">浏览…</button>
+                    <button id="btnClearFFmpeg" class="ghost">留空</button>
+                  </div>
+                  <div class="src" id="ffmpegState">—</div>
+                </div>
+                <p class="hint">
+                  rodio 自己读不了的容器（<code>.wma</code>、部分 <code>.m4a</code>/<code>.aac</code>）会回退到 ffmpeg。
+                </p>
+              </section>
+            </div>
+
+            <div class="set-group hidden" data-group="window">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/></svg>
+                  <h3>窗口与后台</h3>
+                  <div class="spacer"></div>
+                </header>
+                <label class="switch">
+                  <input type="checkbox" id="cfgCloseToTray"><i></i>
+                  <span class="switch-text">点关闭按钮时收进托盘，不退出程序<small>关掉这一项，点 ✕ 就直接退出。托盘图标上双击可以重新打开窗口。</small></span>
+                </label>
+              </section>
+            </div>
+
+            <div class="set-group hidden" data-group="network">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
+                  <h3>代理</h3>
+                  <div class="spacer"></div>
+                  <button id="btnTestNetwork" class="ghost">测试连接</button>
+                </header>
+                <div class="field">
+                  <label for="cfgProxy">代理地址</label>
+                  <div class="row-inline">
+                    <input type="text" id="cfgProxy" spellcheck="false" placeholder="留空则跟随系统代理设置">
+                    <button id="btnProxyDirect" class="ghost">强制直连</button>
+                  </div>
+                  <div class="src" id="proxyState">—</div>
+                  <small>
+                    填 <code>-</code> 强制直连，连环境变量也不看。地址要带协议头，例如 <code>socks5://127.0.0.1:1080</code>。
+                  </small>
+                </div>
+                <p class="hint">按当前填的值真的问一次 Shazam，不识别任何文件。</p>
+              </section>
+
+              <section class="sect" style="margin-top:16px">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18"/></svg>
+                  <h3>请求身份</h3>
+                  <div class="spacer"></div>
+                  <span class="sect-note">留空就用内置的</span>
+                </header>
+                <label class="switch">
+                  <input type="checkbox" id="cfgUAEnabled"><i></i>
+                  <span class="switch-text">自定义 User-Agent<small>只有 App 的 User-Agent 能进 Shazam 接口，浏览器串会被直接拒绝。</small></span>
+                </label>
+                <div class="field" style="margin-top:16px">
+                  <label for="cfgUserAgent">User-Agent</label>
+                  <input type="text" id="cfgUserAgent" spellcheck="false" placeholder="Dalvik/2.1.0 (Linux; U; Android …)" disabled>
+                </div>
+              </section>
+            </div>
+
+            <div class="set-group hidden" data-group="files">
+              <section class="sect">
+                <header class="sect-head">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h6l2 2h8v12H4z"/><path d="M4 11h16"/></svg>
+                  <h3>文件位置</h3>
+                  <div class="spacer"></div>
+                </header>
+                <div class="kv">
+                  <dt>配置</dt><dd class="mono muted" id="pathConfig">—</dd>
+                  <dt>日志</dt><dd class="mono muted" id="pathLog">—</dd>
+                  <dt>识别程序</dt><dd class="mono muted" id="pathSidecar">—</dd>
+                </div>
+                <p class="hint">配置、日志、改名记录都在程序旁边的 <code>data/</code> 目录里，不写 <code>%AppData%</code>；拷走整个目录就是一次完整迁移。</p>
+              </section>
+            </div>
+
+          </div>
+
+          <footer class="ws-foot">
+            <span class="foot-state" id="cfgState">—</span>
+            <div class="spacer"></div>
+            <button id="btnOpenLog">打开日志</button>
+            <button id="btnOpenDir">打开配置目录</button>
+            <button id="btnSaveSettings" class="primary">保存设置</button>
+          </footer>
+        </section>
+      </div>
+
+  </div>
+</div>
+
+<div class="dropzone" id="dropzone">松开鼠标，把音乐/视频加进队列</div>
+
+<!-- 确认弹窗。结构写死在 HTML 里，JS 只负责填文字和开关——
+     动态拼 DOM 的话，每次调用都要重新挂一遍键盘和焦点处理，容易漏。 -->
+<div class="modal-mask hidden" id="modalMask">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <svg id="modalIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5h.01"/></svg>
+      <h3 id="modalTitle">确认</h3>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <!-- 输入行和正文分开两块：正文是 textContent 直接塞的，
+         输入框塞进去会被下一次赋值抹掉。askInput 用得到它，askConfirm 就把它藏着。 -->
+    <div class="modal-field hidden" id="modalField">
+      <input type="text" id="modalInput" spellcheck="false" aria-labelledby="modalTitle">
+    </div>
+    <div class="modal-foot">
+      <button id="modalCancel">取消</button>
+      <button id="modalOk" class="primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const App = window.go.main.App;
+const RT = window.runtime;
+
+const STATUS_LABEL = {
+  pending: '待处理', running: '识别中', matched: '已识别', renamed: '已改名',
+  preview: '预览', no_match: '未识别', failed: '失败', skipped: '跳过', canceled: '已停止',
+};
+
+const STATUS_FILTERS = [
+  { id: 'all', label: '全部状态' },
+  { id: 'matched', label: '已识别', group: ['matched', 'renamed', 'preview'] },
+  { id: 'unmatched', label: '未识别', group: ['no_match'] },
+  { id: 'failed', label: '失败', group: ['failed'] },
+  { id: 'skipped', label: '跳过', group: ['skipped'] },
+];
+
+const SIZE_FILTERS = [
+  { id: 'all', label: '不限大小' },
+  { id: 'lt100', label: '小于 100 MB', test: (n) => n < 100 * 1024 * 1024 },
+  { id: 'gt100', label: '大于 100 MB', test: (n) => n >= 100 * 1024 * 1024 },
+  { id: 'lt1g', label: '小于 1 GB', test: (n) => n < 1024 * 1024 * 1024 },
+];
+
+const el = (id) => document.getElementById(id);
+const items = new Map();
+const rows = new Map();
+const selected = new Set();
+
+let activeStatus = 'all';
+let activeSize = 'all';
+let running = false;
+let paused = false;
+let settings = null;
+let currentPane = 'log';
+let focusedIndex = -1;
+
+// ---------------------------------------------------------------- 工具
+
+const formatSize = (bytes) => {
+  if (!bytes) return '—';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return value.toFixed(unit === 0 ? 0 : 1) + ' ' + units[unit];
+};
+
+const formatTime = (ms) => new Date(ms).toLocaleString('zh-CN', { hour12: false });
+
+function statusGroup(status) {
+  const found = STATUS_FILTERS.find((f) => f.group && f.group.includes(status));
+  return found ? found.id : 'all';
+}
+
+function visible(item) {
+  if (activeStatus !== 'all' && statusGroup(item.status) !== activeStatus) return false;
+  if (activeSize !== 'all') {
+    const rule = SIZE_FILTERS.find((s) => s.id === activeSize);
+    if (rule && rule.test && !rule.test(item.size || 0)) return false;
+  }
+  return true;
+}
+
+function pill(status) {
+  const span = document.createElement('span');
+  span.className = 'pill s-' + status;
+  span.textContent = STATUS_LABEL[status] || status;
+  return span;
+}
+
+// ---------------------------------------------------------------- 确认弹窗
+//
+// 原来这五处用的是 WebView 原生的 confirm()。它是浅色的系统对话框，
+// 从这套深色界面里弹出来像另一个程序，而且没法改文案结构（比如把「磁盘上的
+// 文件不会被删除」单独强调）。自己画一个，行为上和 confirm 一样是**阻塞式**的：
+// 调用方 await 一下就知道用户点了确定还是取消，不用把业务逻辑拆成回调。
+
+const modalMask = el('modalMask');
+let modalResolve = null;
+let modalLastFocus = null;
+
+const MODAL_ICON = {
+  // 危险操作：红色三角，和按钮颜色呼应。
+  danger: '<path d="M12 9.5v4M12 17h.01"/><path d="M10.3 3.9 2.5 17.4A1.8 1.8 0 0 0 4 20h16a1.8 1.8 0 0 0 1.5-2.6L13.7 3.9a1.8 1.8 0 0 0-3.4 0z"/>',
+  // 普通确认：问号圆圈。
+  ask: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.2a2.6 2.6 0 0 1 5 .9c0 1.7-2.5 2-2.5 3.6"/><path d="M12 17h.01"/>',
+};
+
+function closeModal(result) {
+  modalMask.classList.add('hidden');
+  // 输入行也一起收掉。放在这里而不是各自的调用点：askInput 之后如果又弹了个
+  // askConfirm，上一轮的输入框会留在卡片里，看着像「这次也要填点什么」。
+  el('modalField').classList.add('hidden');
+  const resolve = modalResolve;
+  modalResolve = null;
+  // 焦点还给触发它的那个按钮，键盘用户不会「掉」到页面顶上。
+  if (modalLastFocus && document.contains(modalLastFocus)) modalLastFocus.focus();
+  modalLastFocus = null;
+  if (resolve) resolve(result);
+}
+
+/**
+ * askConfirm({ title, body, ok, danger }) → Promise<boolean>
+ *
+ * 点遮罩、按 Esc 都算取消；按 Enter 算确定。
+ */
+function askConfirm(options) {
+  const opts = options || {};
+  const danger = !!opts.danger;
+
+  el('modalTitle').textContent = opts.title || '确认';
+  el('modalBody').textContent = opts.body || '';
+  el('modalIcon').innerHTML = danger ? MODAL_ICON.danger : MODAL_ICON.ask;
+  el('modalIcon').style.color = danger ? 'var(--err)' : 'var(--accent)';
+
+  const ok = el('modalOk');
+  ok.textContent = opts.ok || '确定';
+  ok.className = danger ? 'danger' : 'primary';
+
+  modalLastFocus = document.activeElement;
+  modalMask.classList.remove('hidden');
+  // 默认焦点落在「取消」上：危险操作不该一个回车就执行。
+  el('modalCancel').focus();
+
+  return new Promise((resolve) => { modalResolve = resolve; });
+}
+
+/**
+ * askInput({ title, body, value, placeholder, ok }) → Promise<string|null>
+ *
+ * 和 askConfirm 同一张卡片，只是多一行输入框。取消、按 Esc、点遮罩都返回 null；
+ * 确认但内容全是空白也返回 null —— 「取消」和「填了个空的」对调用方是同一件事，
+ * 都不该往下走。这样调用方只需要判断 `if (!name) return;` 一种情况。
+ *
+ * 不用原生 prompt()：它是浅色的系统对话框，而且挡不住误操作。
+ */
+function askInput(options) {
+  const opts = options || {};
+
+  el('modalTitle').textContent = opts.title || '输入';
+  el('modalBody').textContent = opts.body || '';
+  el('modalIcon').innerHTML = MODAL_ICON.ask;
+  el('modalIcon').style.color = 'var(--accent)';
+
+  const ok = el('modalOk');
+  ok.textContent = opts.ok || '确定';
+  ok.className = 'primary';
+
+  const input = el('modalInput');
+  input.value = opts.value || '';
+  input.placeholder = opts.placeholder || '';
+  el('modalField').classList.remove('hidden');
+
+  modalLastFocus = document.activeElement;
+  modalMask.classList.remove('hidden');
+  // 一进来就全选：重命名十有八九是「整个换掉」，而不是在原名上改一个字。
+  input.focus();
+  input.select();
+
+  return new Promise((resolve) => {
+    modalResolve = (accepted) => {
+      const name = input.value.trim();
+      resolve(accepted && name ? name : null);
+    };
+  });
+}
+
+el('modalCancel').onclick = () => closeModal(false);
+el('modalOk').onclick = () => closeModal(true);
+// 点卡片外面 = 取消。点卡片里面不该关。
+modalMask.onmousedown = (event) => { if (event.target === modalMask) closeModal(false); };
+document.addEventListener('keydown', (event) => {
+  if (modalMask.classList.contains('hidden')) return;
+  if (event.key === 'Escape') { event.preventDefault(); closeModal(false); }
+  else if (event.key === 'Enter') { event.preventDefault(); closeModal(true); }
+});
+
+function progressCell(item) {
+  const wrap = document.createElement('div');
+  wrap.className = 'minibar';
+  const bar = document.createElement('i');
+  const map = {
+    pending: [0, ''], running: [45, ''],
+    matched: [100, 'ok'], renamed: [100, 'ok'], preview: [100, 'ok'],
+    no_match: [100, 'warn'], failed: [100, 'err'],
+    skipped: [100, 'mute'], canceled: [100, 'mute'],
+  };
+  const [width, cls] = map[item.status] || [0, ''];
+  bar.style.width = width + '%';
+  if (cls) bar.className = cls;
+  wrap.appendChild(bar);
+  return wrap;
+}
+
+function cell(text, className) {
+  const td = document.createElement('td');
+  if (className) td.className = className;
+  td.textContent = text == null ? '' : String(text);
+  td.title = td.textContent;
+  return td;
+}
+
+function buildRow(item) {
+  const tr = document.createElement('tr');
+  tr.dataset.index = item.index;
+
+  const cCheck = document.createElement('td');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.onclick = (e) => {
+    e.stopPropagation();
+    if (box.checked) selected.add(item.index); else selected.delete(item.index);
+    tr.classList.toggle('selected', box.checked);
+    syncSelectionUI();
+  };
+  cCheck.appendChild(box);
+
+  const cFile = cell('', 'mono');
+  const cTitle = cell('');
+  const cArtist = cell('');
+  const cNew = cell('', 'mono');
+  const cStatus = document.createElement('td');
+  const cProgress = document.createElement('td');
+  const cOps = document.createElement('td');
+  cOps.className = 'ops';
+
+  tr.append(cCheck, cFile, cTitle, cArtist, cNew, cStatus, cProgress, cOps);
+  tr._cells = { box, cFile, cTitle, cArtist, cNew, cStatus, cProgress, cOps };
+  tr.onclick = () => focusItem(item.index);
+  return tr;
+}
+
+function paintRow(tr, item) {
+  const c = tr._cells;
+  c.cFile.textContent = item.name;
+  c.cTitle.textContent = item.title || '';
+  c.cTitle.title = [item.title, item.album, item.released].filter(Boolean).join(' · ');
+  c.cArtist.textContent = item.artist || '';
+  c.cNew.textContent = item.newName || '';
+  c.cNew.title = item.newPath || '';
+  c.cStatus.replaceChildren(pill(item.status));
+  c.cProgress.replaceChildren(progressCell(item));
+
+  c.cStatus.title = item.message || '';
+  c.cFile.title = item.message ? item.path + '\n' + item.message : item.path;
+
+  const ops = [];
+  if (item.shazamUrl) {
+    const open = document.createElement('button');
+    open.textContent = 'Shazam';
+    open.onclick = (e) => { e.stopPropagation(); App.OpenURL(item.shazamUrl).catch(() => {}); };
+    ops.push(open);
+  }
+  const target = item.newPath || item.path;
+  if (target) {
+    const reveal = document.createElement('button');
+    reveal.textContent = '定位';
+    reveal.onclick = (e) => { e.stopPropagation(); App.RevealPath(target).catch(() => {}); };
+    ops.push(reveal);
+  }
+  c.cOps.replaceChildren(...ops);
+
+  c.box.checked = selected.has(item.index);
+  tr.classList.toggle('selected', selected.has(item.index));
+  tr.classList.toggle('hidden', !visible(item));
+}
+
+function upsert(item) {
+  items.set(item.index, item);
+  let tr = rows.get(item.index);
+  if (!tr) {
+    tr = buildRow(item);
+    rows.set(item.index, tr);
+    el('tbody').appendChild(tr);
+  }
+  paintRow(tr, item);
+  refreshEmptyState();
+}
+
+function rebuild(list) {
+  items.clear();
+  rows.clear();
+  selected.clear();
+  el('tbody').replaceChildren();
+  for (const item of list) upsert(item);
+  refreshEmptyState();
+  syncSelectionUI();
+}
+
+function refreshEmptyState() {
+  const any = items.size > 0;
+  el('empty').style.display = any ? 'none' : 'flex';
+  el('tablewrap').style.display = any ? 'block' : 'none';
+}
+
+function repaintAll() {
+  for (const [index, tr] of rows) {
+    const item = items.get(index);
+    if (item) tr.classList.toggle('hidden', !visible(item));
+  }
+  refreshEmptyState();
+}
+
+function syncSelectionUI() {
+  el('counter').textContent = selected.size
+    ? `已选 ${selected.size} / 共 ${items.size} 个`
+    : `${items.size} 个任务`;
+  el('btnRemove').classList.toggle('hidden', selected.size === 0);
+  el('checkAll').checked = items.size > 0 && selected.size === items.size;
+}
+
+// 进度条只在「正在跑」的时候才有意义。
+//
+// 不这么判的话，跑完一轮它会停在 100% —— 在文件列表上沿留下一条常驻蓝线，
+// 看着像装饰，其实什么都没表示。而且下次启动 boot() 里的
+// `renderProgress(await App.Progress())` 还会把它照原样画回来。
+function renderProgress(p) {
+  const pct = running && p.total ? Math.round((p.done / p.total) * 100) : 0;
+  el('progressFill').style.width = pct + '%';
+}
+
+function setRunning(value) {
+  running = value;
+  el('btnStart').disabled = value;
+  el('btnStop').disabled = !value;
+  el('btnPause').disabled = !value;
+  el('btnAddFiles').disabled = value;
+  el('btnAddFolder').disabled = value;
+  el('btnRescan').disabled = value;
+  if (!value) {
+    paused = false;
+    paintPauseButton();
+    // running 已经是 false，这里一调就把进度条清空。
+    renderProgress({});
+  }
+}
+
+function paintPauseButton() {
+  el('btnPause').classList.toggle('on', paused);
+  el('btnPauseLabel').textContent = paused ? '继续' : '暂停';
+}
+
+// ---------------------------------------------------------------- 窗口
+//
+// 窗口是无边框的，最小化 / 最大化 / 关闭全归这里管。
+// Wails 没有窗口状态变化的事件，所以最大化状态只能轮询——400ms 一次，
+// 开销可以忽略，换来的是「Win+↑ 之类的外部操作也能反映到图标上」。
+
+let maximised = false;
+
+function paintMaxIcon() {
+  el('iconMax').classList.toggle('hidden', maximised);
+  el('iconRestore').classList.toggle('hidden', !maximised);
+  el('winMax').title = maximised ? '向下还原' : '最大化';
+}
+
+async function syncMaximised() {
+  try {
+    const value = await RT.WindowIsMaximised();
+    if (value !== maximised) { maximised = value; paintMaxIcon(); }
+  } catch (_) { /* 窗口还没准备好，下一轮再说 */ }
+}
+
+el('winMin').onclick = () => RT.WindowMinimise();
+el('winMax').onclick = () => { RT.WindowToggleMaximise(); setTimeout(syncMaximised, 60); };
+el('winClose').onclick = () => App.CloseWindow();
+
+el('titlebar').ondblclick = (event) => {
+  if (event.target.closest('.wbtns') || event.target.closest('.status')) return;
+  RT.WindowToggleMaximise();
+  setTimeout(syncMaximised, 60);
+};
+
+setInterval(syncMaximised, 400);
+
+// ---------------------------------------------------------------- 自检状态
+
+function setChip(id, textId, state, text, tip) {
+  const chip = el(id);
+  chip.className = 'status' + (state ? ' ' + state : '');
+  el(textId).textContent = text;
+  chip.title = (tip ? tip + '\n' : '') + '点一下重新自检';
+}
+
+function setSource(node, state, text) {
+  node.className = 'src' + (state ? ' ' + state : '');
+  node.textContent = text;
+}
+
+async function refreshCheck() {
+  let check;
+  try {
+    check = await App.SelfCheck();
+  } catch (error) {
+    setChip('chipSidecar', 'chipSidecarText', 'err', '自检失败', String(error));
+    setChip('chipFFmpeg', 'chipFFmpegText', 'err', 'ffmpeg 未知', String(error));
+    return;
+  }
+
+  // 名称是 HTML 里的固定标签（shazam-sidecar），这里只填值。
+  // 别指望 sidecar 的 --env 把名字拼进 version —— 它只报 "0.1.0"。
+  if (check.ok) {
+    setChip('chipSidecar', 'chipSidecarText', 'ok', check.sidecarVersion || '就绪',
+      '识别程序：' + (check.sidecarPath || '未知'));
+  } else {
+    setChip('chipSidecar', 'chipSidecarText', 'err', check.problem || '不可用',
+      [check.sidecarPath, check.hint].filter(Boolean).join('\n'));
+  }
+
+  // ffmpeg 状态分三种：跑得起来 / 没找到 / 填了但跑不起来。
+  if (check.ffmpegPath) {
+    setChip('chipFFmpeg', 'chipFFmpegText', 'ok', '就绪', check.ffmpegPath);
+  } else if (check.ffmpegConfigured) {
+    setChip('chipFFmpeg', 'chipFFmpegText', 'err', '路径无效',
+      '设置里填的是：' + check.ffmpegConfigured);
+  } else {
+    setChip('chipFFmpeg', 'chipFFmpegText', 'warn', '未找到',
+      'mp4/mkv/mp3/flac/wav/ogg 不受影响；.wma 与部分 .m4a 会读不了');
+  }
+
+  // 「来源」那一行。跑得起来就绿色写清实际用的是哪一份，
+  // 跑不起来要区分「没填」和「填了但没用上」——后者最容易被误解成生效了。
+  const source = el('ffmpegState');
+  if (check.ffmpegPath) {
+    setSource(source, 'ok', '来源：' + check.ffmpegPath);
+  } else if (check.ffmpegConfigured) {
+    setSource(source, 'err', '填的这份跑不起来：' + check.ffmpegConfigured);
+  } else {
+    setSource(source, 'warn', '系统 PATH 和程序同目录都没找到');
+  }
+
+  el('pathConfig').textContent = check.configPath;
+  el('pathLog').textContent = check.logPath;
+  el('pathSidecar').textContent = check.sidecarPath || '未找到';
+
+  if (!check.ok) log('ERROR', check.problem + (check.hint ? ' —— ' + check.hint : ''));
+  else if (!check.ffmpegPath) log('WARN', '没有 ffmpeg：.wma 与部分 .m4a 会读不了');
+  if (check.configError) log('WARN', check.configError);
+}
+
+el('chipSidecar').onclick = refreshCheck;
+el('chipFFmpeg').onclick = refreshCheck;
+
+// ---------------------------------------------------------------- 日志 / 详情
+
+function log(level, message, time) {
+  const pane = el('pane-log');
+  const line = document.createElement('div');
+  line.className = 'logline ' + (level || 'INFO');
+  const stamp = document.createElement('span');
+  stamp.className = 't';
+  stamp.textContent = (time || new Date().toTimeString().slice(0, 8)) + '  ';
+  line.append(stamp, document.createTextNode(message));
+  pane.appendChild(line);
+  while (pane.childElementCount > 500) pane.removeChild(pane.firstChild);
+  if (currentPane === 'log') pane.scrollTop = pane.scrollHeight;
+}
+
+function focusItem(index) {
+  focusedIndex = index;
+  const item = items.get(index);
+  if (!item) return;
+  renderDetail(item);
+  renderCommand(item);
+  for (const [key, tr] of rows) tr.classList.toggle('focused', key === index);
+}
+
+const SCRIPT_NAMES = { english: '英文', chinese: '中文', japanese: '日文', korean: '韩文', other: '其他' };
+
+function renderDetail(item) {
+  const body = el('detailBody');
+  body.replaceChildren();
+
+  const variants = Object.entries(item.titles || {})
+    .map(([script, value]) => (SCRIPT_NAMES[script] || script) + '：' + value)
+    .join('\n');
+
+  const rowsData = [
+    ['文件名', item.name],
+    ['完整路径', item.path],
+    ['大小', formatSize(item.size)],
+    ['状态', (STATUS_LABEL[item.status] || item.status) + (item.attempts ? `（尝试 ${item.attempts} 次）` : '')],
+    ['歌名', item.title],
+    ['其他写法', variants],
+    ['艺人', item.artist],
+    ['专辑', item.album],
+    ['流派', item.genre],
+    ['发行', item.released],
+    ['唱片', item.label],
+    ['新文件名', item.newName],
+    ['Shazam', item.shazamUrl],
+    ['说明', item.message],
+  ];
+
+  for (const [key, value] of rowsData) {
+    if (!value) continue;
+    const dt = document.createElement('dt');
+    dt.textContent = key;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    body.append(dt, dd);
+  }
+}
+
+async function renderCommand(item) {
+  const body = el('commandBody');
+  try {
+    body.textContent = await App.PreviewCommand(item.path);
+  } catch (error) {
+    body.textContent = String(error);
+  }
+}
+
+// ---------------------------------------------------------------- 事件
+
+RT.EventsOn('job:item', (item) => upsert(item));
+RT.EventsOn('job:progress', (p) => renderProgress(p));
+RT.EventsOn('job:log', (payload) => log(payload.level, payload.message, payload.time));
+RT.EventsOn('job:done', (summary) => {
+  setRunning(false);
+  if (summary && summary.reason) log('WARN', summary.reason);
+  if (summary && summary.total) {
+    log('INFO', `完成：识别 ${summary.matched}，未识别 ${summary.unmatched}，失败 ${summary.failed}，` +
+      `改名 ${summary.renamed}，跳过 ${summary.skipped}，耗时 ${(summary.elapsedMs / 1000).toFixed(1)} 秒`);
+  }
+  loadHistory();
+});
+
+// 拖放。
+//
+// 必须在这里调 runtime.OnFileDrop —— Wails 是**由这个调用**去装 DOM 的
+// dragover/drop 处理器的，光在 Go 侧注册收不到任何东西。
+RT.OnFileDrop((x, y, paths) => {
+  if (paths && paths.length) addPaths(paths);
+});
+
+// 拖放高亮。用计数是因为 dragenter/dragleave 会在子元素之间反复触发。
+//
+// **只有拖着文件**才亮。这条判断是补上的：在界面里选中一段文字、或者拖
+// 槽位排序，Chromium 一样会发 dragenter —— 于是整个界面盖上一层
+// 「松开鼠标，把音乐/视频加进队列」，而用户手里根本没有文件。
+//
+// 判断看的是 dataTransfer.items 里的 kind，不是 types：
+// Chromium 会把拖文本的 dataTransfer 也填上 `text/plain`，
+// 而 HTML5 拖放**要求**在 dragstart 里 setData，所以按 types 判断必然误判。
+let dragDepth = 0;
+
+function draggingFiles(event) {
+  const dt = event.dataTransfer;
+  if (!dt) return false;
+  if (dt.items && dt.items.length) {
+    for (const item of dt.items) {
+      if (item.kind === 'file') return true;
+    }
+    return false;
+  }
+  // items 在部分环境（老 WebView、合成事件）里没有，退回看 types。
+  // 注意 'Files' 是大小写敏感的固定值。
+  return Array.prototype.indexOf.call(dt.types || [], 'Files') >= 0;
+}
+
+window.addEventListener('dragenter', (event) => {
+  if (!draggingFiles(event)) return;
+  dragDepth += 1;
+  el('dropzone').classList.add('on');
+});
+window.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) el('dropzone').classList.remove('on');
+});
+window.addEventListener('drop', () => {
+  dragDepth = 0;
+  el('dropzone').classList.remove('on');
+});
+
+// ---------------------------------------------------------------- 动作
+
+async function scanPath(path) {
+  if (!path) return;
+  try {
+    const list = await App.ScanPath(path);
+    rebuild(list);
+    log('INFO', `已载入 ${list.length} 个文件：${path}`);
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+}
+
+async function addPaths(paths) {
+  if (!paths || !paths.length) return;
+  try {
+    const result = await App.AddPaths(paths);
+    rebuild(result.items);
+    if (result.added > 0) log('INFO', `新增 ${result.added} 个文件，队列共 ${result.items.length} 个`);
+    else log('WARN', '这次没有新增文件（可能已经在队列里了）');
+    // 被挡下的必须说出来，否则用户只会看到「拖了没反应」。
+    for (const line of result.rejected || []) log('WARN', '已跳过 ' + line);
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+}
+
+el('btnAddFiles').onclick = async () => {
+  const paths = await App.PickFiles();
+  if (paths && paths.length) addPaths(paths);
+};
+
+el('btnAddFolder').onclick = async () => {
+  const path = await App.PickFolder();
+  if (path) scanPath(path);
+};
+
+el('btnRescan').onclick = async () => {
+  const list = await App.Items();
+  if (!list.length) { log('WARN', '还没有目录可以重扫'); return; }
+  log('INFO', '重新扫描 ' + list[0].dir);
+  scanPath(list[0].dir);
+};
+
+async function start(scope) {
+  setRunning(true);
+  try { await App.Start(scope); }
+  catch (error) { setRunning(false); log('ERROR', String(error)); }
+}
+
+el('btnStart').onclick = () => start('pending');
+
+el('btnPause').onclick = async () => {
+  if (paused) { await App.Resume(); paused = false; log('INFO', '已继续'); }
+  else { await App.Pause(); paused = true; log('WARN', '已暂停：当前文件跑完后不再取新文件'); }
+  paintPauseButton();
+};
+
+el('btnStop').onclick = async () => {
+  await App.Stop();
+  log('WARN', '已请求停止…');
+};
+
+el('btnRemove').onclick = async () => {
+  if (!selected.size) return;
+  if (!await askConfirm({
+    title: '移出队列',
+    body: `把选中的 ${selected.size} 个条目移出队列。\n磁盘上的文件不会被删除。`,
+    ok: '移出',
+  })) return;
+  const list = await App.RemoveItems([...selected]);
+  rebuild(list);
+  log('INFO', `已移出队列，剩 ${list.length} 个`);
+};
+
+el('checkAll').onchange = (e) => {
+  selected.clear();
+  if (e.target.checked) {
+    for (const item of items.values()) if (visible(item)) selected.add(item.index);
+  }
+  for (const [index, tr] of rows) {
+    const on = selected.has(index);
+    tr._cells.box.checked = on;
+    tr.classList.toggle('selected', on);
+  }
+  syncSelectionUI();
+};
+
+el('btnClear').onclick = async () => {
+  if (!await askConfirm({
+    title: '清空队列',
+    body: '队列里的条目会全部移除。\n磁盘上的文件不会被删除。',
+    ok: '清空',
+  })) return;
+  await App.Clear();
+  rebuild([]);
+  renderProgress({});
+  log('INFO', '队列已清空');
+};
+
+el('btnExport').onclick = async () => {
+  try {
+    const path = await App.ExportCSV();
+    if (path) log('INFO', '已导出：' + path);
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+};
+
+for (const f of STATUS_FILTERS) {
+  const option = document.createElement('option');
+  option.value = f.id; option.textContent = f.label;
+  el('selStatus').appendChild(option);
+}
+el('selStatus').onchange = (e) => { activeStatus = e.target.value; repaintAll(); };
+
+for (const s of SIZE_FILTERS) {
+  const option = document.createElement('option');
+  option.value = s.id; option.textContent = s.label;
+  el('selSize').appendChild(option);
+}
+el('selSize').onchange = (e) => { activeSize = e.target.value; repaintAll(); };
+
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.onclick = () => {
+    currentPane = tab.dataset.pane;
+    for (const other of document.querySelectorAll('.tab')) other.classList.toggle('on', other === tab);
+    el('pane-log').classList.toggle('hidden', currentPane !== 'log');
+    el('pane-detail').classList.toggle('hidden', currentPane !== 'detail');
+    el('pane-command').classList.toggle('hidden', currentPane !== 'command');
+    if (focusedIndex >= 0) focusItem(focusedIndex);
+  };
+}
+
+el('btnToggleBottom').onclick = () => el('bottom').classList.toggle('collapsed');
+
+for (const nav of document.querySelectorAll('.nav')) {
+  nav.onclick = () => {
+    for (const other of document.querySelectorAll('.nav')) other.classList.toggle('active', other === nav);
+    for (const view of ['tasks', 'templates', 'history', 'settings']) {
+      el('view-' + view).classList.toggle('hidden', view !== nav.dataset.view);
+    }
+    if (nav.dataset.view === 'history') loadHistory();
+  };
+}
+
+// ---------------------------------------------------------------- 模板
+
+// 模板页的静态选项（槽位下拉）**来自 Go**。
+//
+// 不在这里各写一份：前后端之间是字符串约定，`{title:zh}` 在前端写成
+// `{title:cn}` 不会有任何编译错误，只会在用户点保存之后才悄悄出错。
+//
+// 目录的形状是「拍平」过的：一个下拉里直接写「中文歌名」，
+// 而不是「歌名 + 中文」两个下拉框拼出来 —— 选一次位置动一次手就够。
+let templateOptions = { choices: [], defaultSeparator: ' - ' };
+
+let templates = [];
+// editing 是编辑器里正在编辑的模板名；null 表示这是一份还没保存的新模板。
+let editing = null;
+
+// draft 是编辑器里的工作副本：改动先落在这里，点「保存」才写回后端。
+//
+// 不做「改一下就存」是因为槽位编辑会产生大量中间状态（刚加了一格还没选变量、
+// 分隔符打到一半），每一下都存会往配置里写一堆半成品。
+//
+// **没有 name 字段**。名字的归属是 editing（以及左边那一列），
+// 编辑器里再存一份就要同步两份 —— 以前那个「名称」输入框就是这么来的，
+// 现在名字只在左栏右键里改，这里也就不该有第二份。
+let draft = { separator: ' - ', slots: [] };
+
+// dragFrom 是正在被拖的那一段；-1 表示没有在拖。
+let dragFrom = -1;
+
+function blankSlot() {
+  return { var: 'title', script: '', text: '', prefix: '', suffix: '', separator: null };
+}
+
+// cloneSlot 把后端给的槽位规整成编辑器用的形状。
+//
+// separator 的 null 和 '' 是**两回事**，这里不能一起归一化：
+//   null → 跟随全局分隔符
+//   ''   → 明确不要分隔符（「歌名 (年份)」的年份那格就是这种）
+// 一旦都写成 ''，用户存一次之后「歌名 (年份)」就会变成「歌名 - (年份)」。
+function cloneSlot(slot) {
+  const source = slot || {};
+  return {
+    var: source.var || '',
+    script: source.script || '',
+    text: source.text || '',
+    prefix: source.prefix || '',
+    suffix: source.suffix || '',
+    separator: source.separator === undefined ? null : source.separator,
+  };
+}
+
+// choiceKey 把「变量 + 语种」拼成下拉框里的选项值。
+//
+// 用冒号分隔是刻意的：它和模板里 `{title:zh}` 的写法一致，
+// 出问题时对着两边看能一眼对上。
+function choiceKey(variable, script) {
+  return script ? variable + ':' + script : variable;
+}
+
+function slotKey(slot) {
+  return choiceKey(slot.var || '', slot.script || '');
+}
+
+// choiceLabel 是「这一段是什么」的短标签，摘要和下拉兜底都用它。
+function choiceLabel(variable, script) {
+  const found = templateOptions.choices.find(
+    (c) => c.var === variable && (c.script || '') === (script || ''));
+  return found ? found.label : choiceKey(variable, script);
+}
+
+function slotLabel(slot) {
+  if (slot.var === 'literal') return '「' + (slot.text || '') + '」';
+  return choiceLabel(slot.var, slot.script);
+}
+
+// describeTemplate 把一份模板拼成一行可读的摘要，给左栏列表用。
+function describeTemplate(tpl) {
+  const slots = tpl.slots || [];
+  let out = '';
+  slots.forEach((slot, index) => {
+    if (index > 0) {
+      const own = slot.separator === null || slot.separator === undefined ? null : slot.separator;
+      out += own === null ? (tpl.separator || ' - ') : own;
+    }
+    out += slotLabel(slot);
+  });
+  return out;
+}
+
+
+// ---------------------------------------------------------------- 槽位列表
+
+// renderSlotList 画一列槽位行。
+//
+// 「+ 添加」那个按钮**写在 HTML 里**，这里只往它前面插行 ——
+// 不这么做的话每次重画都要把按钮也重建一遍，而它身上挂着 onclick，
+// 重建就等于把监听丢了。重画类代码最常见的坑就是这个。
+function renderSlotList() {
+  const box = el('slotList');
+  const add = el('btnAddSlot');
+
+  for (const old of box.querySelectorAll('.slotchip, .tpl-empty')) old.remove();
+
+  if (!draft.slots.length) {
+    const empty = document.createElement('span');
+    empty.className = 'tpl-empty';
+    empty.textContent = '还没有任何一段。点右边的「添加」加一段。';
+    box.insertBefore(empty, add);
+  }
+
+  draft.slots.forEach((slot, index) => box.insertBefore(slotChip(slot, index), add));
+}
+
+function slotChip(slot, index) {
+  const chip = document.createElement('div');
+  chip.className = 'slotchip';
+  chip.dataset.index = String(index);
+
+  const select = document.createElement('select');
+  select.title = '这一段放什么';
+  // 关掉拼写检查。无头 Chrome 会在选中的选项文字下面画一条红色波浪线
+  // （「英文名」这种词不在它词典里），截图里看着像出了错。
+  select.spellcheck = false;
+
+  // 按 group 分 <optgroup>：歌名和艺人各带六个语种变体，
+  // 不分组的会铺成一条十七项的平表，找起来很累。
+  const groups = new Map();
+  for (const choice of templateOptions.choices) {
+    const name = choice.group || '其他';
+    if (!groups.has(name)) {
+      const group = document.createElement('optgroup');
+      group.label = name;
+      groups.set(name, group);
+      select.appendChild(group);
+    }
+    const option = document.createElement('option');
+    option.value = choiceKey(choice.var, choice.script);
+    option.textContent = choice.label;
+    groups.get(name).appendChild(option);
+  }
+
+  // 兜底：配置里可能存着目录中没有的组合（手改过配置，或者跨版本升级）。
+  // 不补这一项的话 select.value 赋不上，界面会显示成第一项 ——
+  // 用户看到的和实际存的不一样，这是最难发现的一类不一致。
+  const key = slotKey(slot);
+  if (!templateOptions.choices.some((c) => choiceKey(c.var, c.script) === key)) {
+    const option = document.createElement('option');
+    option.value = key;
+    option.textContent = key + '（不在目录里）';
+    select.appendChild(option);
+  }
+  select.value = key;
+  select.onchange = () => {
+    const found = templateOptions.choices.find(
+      (c) => choiceKey(c.var, c.script) === select.value);
+    if (!found) return;
+    slot.var = found.var;
+    slot.script = found.script || '';
+    // 换了变量之后，上一格留下的固定文字就没意义了。
+    if (slot.var !== 'literal') slot.text = '';
+    renderSlotList();
+    paintTplPreview();
+    markTemplatesDirty();
+  };
+  chip.appendChild(select);
+
+  // 「固定文字」得配一个输入框，否则这一项没法用。
+  if (slot.var === 'literal') {
+    const text = document.createElement('input');
+    text.type = 'text';
+    text.spellcheck = false;
+    text.placeholder = '写点什么';
+    text.value = slot.text || '';
+    text.oninput = () => {
+      slot.text = text.value;
+      paintTplPreview();
+      markTemplatesDirty();
+    };
+    chip.appendChild(text);
+  }
+
+  // 这一格自己的「分隔符 / 前缀 / 后缀」直接摊在这一行里，不再折叠。
+  //
+  // 折叠那版的代价是：想知道某一段设了什么，得先点开它 —— 而这一页
+  // 本来就是用来一眼看全的。展开的代价（行变高）由竖排吸收掉了。
+  chip.appendChild(slotFields(slot, index));
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'chip-x';
+  remove.title = '删掉这一段';
+  remove.textContent = '×';
+  remove.onclick = () => removeSlot(index);
+  chip.appendChild(remove);
+
+  makeDraggable(chip, index);
+  return chip;
+}
+
+// slotFields 画某一格自己的「分隔符 / 前缀 / 后缀」。
+//
+// 就地长在 chip 里，而不是挂在下面一块独立的「第 N 段」面板上：
+// 面板那种做法必须先点中某个 chip 才知道在改谁，而点 chip 其实点在它里面的
+// <select> 上，会顺带弹出一个系统下拉框。摊进 chip 之后两个别扭一起没了。
+function slotFields(slot, index) {
+  const box = document.createElement('span');
+  box.className = 'chip-fields';
+
+  // 第一段前面没有东西，分隔符对它没意义，所以不画。
+  if (index > 0) {
+    const mode = slot.separator === null || slot.separator === undefined
+      ? 'inherit'
+      : (slot.separator === '' ? 'none' : 'custom');
+
+    box.appendChild(labelText('分隔符'));
+    const modeSelect = document.createElement('select');
+    for (const [value, text] of [['inherit', '跟随全局'], ['none', '不要'], ['custom', '自定义']]) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      modeSelect.appendChild(option);
+    }
+    modeSelect.value = mode;
+    modeSelect.title = '这一格前面插什么。默认跟随上面的全局分隔符。';
+    modeSelect.onchange = () => {
+      if (modeSelect.value === 'inherit') slot.separator = null;
+      else if (modeSelect.value === 'none') slot.separator = '';
+      // 切到自定义时用全局值起手，省得对着空框发呆。
+      else slot.separator = draft.separator || '-';
+      // 切到「自定义」会多出一个输入框，所以这里得重画。
+      renderSlotList();
+      paintTplPreview();
+      markTemplatesDirty();
+    };
+    box.appendChild(modeSelect);
+
+    if (mode === 'custom') {
+      const sepInput = document.createElement('input');
+      sepInput.type = 'text';
+      sepInput.className = 'sep';
+      sepInput.spellcheck = false;
+      sepInput.placeholder = '/';
+      sepInput.value = slot.separator;
+      sepInput.oninput = () => {
+        slot.separator = sepInput.value;
+        paintTplPreview();
+        markTemplatesDirty();
+      };
+      box.appendChild(sepInput);
+    }
+  }
+
+  box.appendChild(labelText('前缀'));
+  box.appendChild(slotFieldInput(slot, 'prefix', '可选',
+    '紧贴在值前面。取不到值时前缀一起消失，所以「歌名 (年份)」的括号挂在这里才安全。'));
+
+  box.appendChild(labelText('后缀'));
+  box.appendChild(slotFieldInput(slot, 'suffix', '可选',
+    '紧贴在值后面，同样跟着值一起消失。'));
+
+  return box;
+}
+
+// slotFieldInput 是前缀 / 后缀共用的那种小输入框。
+function slotFieldInput(slot, field, placeholder, title) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.spellcheck = false;
+  input.placeholder = placeholder;
+  input.title = title;
+  input.value = slot[field] || '';
+  input.oninput = () => {
+    slot[field] = input.value;
+    paintTplPreview();
+    markTemplatesDirty();
+  };
+  return input;
+}
+
+// makeDraggable 用 HTML5 拖放做排序。
+//
+// 竖排之后 ↑↓ 按钮就没意义了（顺序本来就是从上到下），拖拽才是自然的收拾方式。
+// 整个 chip 都是把手：Chromium 要拖出几个像素才算 drag，
+// 所以单击仍然能正常打开里面的下拉框。
+//
+// 注意这里 setData 的是 `text/plain`。它会让窗口级的 dragenter 也收到事件 ——
+// 所以那边的「是不是文件」判断不能只看 types（详见 draggingFiles）。
+function makeDraggable(chip, index) {
+  chip.draggable = true;
+  chip.ondragstart = (event) => {
+    dragFrom = index;
+    chip.classList.add('dragging');
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      // Firefox 不设 data 就不会真的开始拖。
+      event.dataTransfer.setData('text/plain', String(index));
+    }
+  };
+  chip.ondragend = () => {
+    dragFrom = -1;
+    chip.classList.remove('dragging');
+    for (const other of el('slotList').querySelectorAll('.slotchip')) {
+      other.classList.remove('over');
+    }
+  };
+  chip.ondragover = (event) => {
+    if (dragFrom < 0 || dragFrom === index) return;
+    event.preventDefault();
+    chip.classList.add('over');
+  };
+  chip.ondragleave = () => chip.classList.remove('over');
+  chip.ondrop = (event) => {
+    event.preventDefault();
+    chip.classList.remove('over');
+    moveSlotTo(dragFrom, index);
+  };
+}
+
+// 这里原来有个 renderSlotMore()，画的是 chip 行下面那块独立的「第 N 段」面板。
+// 字段搬进 chip 里就地展开之后它没有存在意义了 —— 留着的话它还会去取 #slotMore，
+// 而那个元素已经删掉，拿到 null 再往下写就是 TypeError。
+//
+// （这条注释里别写出那个取元素的调用，frontend_contract_test 会把它当成真实引用，
+//   然后报「id 被引用了但 HTML 里没有」。）
+
+function labelText(text) {
+  const span = document.createElement('span');
+  span.textContent = text;
+  return span;
+}
+
+function addSlot() {
+  // 新的一格默认选「原版歌名」——大多数模板都是从歌名开始的。
+  draft.slots.push(blankSlot());
+  renderSlotList();
+  paintTplPreview();
+  markTemplatesDirty();
+}
+
+function removeSlot(index) {
+  draft.slots.splice(index, 1);
+  renderSlotList();
+  paintTplPreview();
+  markTemplatesDirty();
+}
+
+// moveSlotTo 把 from 那一段挪到 to 的位置。拖拽排序走这里。
+//
+// 单独抽出来是为了能被探针直接调用：HTML5 拖放在无头 Chrome 里没法用脚本触发，
+// 而真正要守的是「换位算得对」，不是「dragstart 绑上了没有」。
+function moveSlotTo(from, to) {
+  if (from < 0 || to < 0 || from >= draft.slots.length || to >= draft.slots.length) return;
+  if (from === to) return;
+  const [moved] = draft.slots.splice(from, 1);
+  draft.slots.splice(to, 0, moved);
+
+  renderSlotList();
+  paintTplPreview();
+  markTemplatesDirty();
+}
+
+// ---------------------------------------------------------------- 预览
+
+// 预览**由后端算**，不在前端用 JS 再实现一遍渲染。
+//
+// 两处各写一份迟早会对不上：用户看到的预览就成了假的，而且越像越不容易发现。
+// 这也顺手删掉了前端那份分隔符清单和整段擦洗逻辑。
+let previewToken = 0;
+
+async function paintTplPreview() {
+  const box = el('tplPreview');
+  const token = ++previewToken;
+
+  let cases;
+  try {
+    cases = await App.PreviewTemplate({
+      // 名字只是为了让这个载荷和 SaveTemplate 长得一样；预览不看它。
+      name: editing || '',
+      separator: draft.separator,
+      slots: draft.slots,
+    });
+  } catch (error) {
+    log('ERROR', '预览失败：' + error);
+    return;
+  }
+  // 打字快的时候会有多个请求在飞，迟到的结果不能盖掉新的。
+  if (token !== previewToken) return;
+
+  box.replaceChildren();
+  for (const item of cases) {
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const key = document.createElement('span');
+    key.className = 'k';
+    key.textContent = item.label;
+
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+
+    const value = document.createElement('div');
+    value.className = 'v' + (item.empty ? ' warn' : '');
+    value.textContent = item.empty ? '（没有可用内容，退回原文件名）' : item.text + '.mp4';
+
+    const note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = item.note;
+
+    cell.append(value, note);
+    row.append(key, cell);
+    box.appendChild(row);
+  }
+}
+
+// ---------------------------------------------------------------- 列表
+
+// paintTemplateList 画左边那一列模板。
+//
+// 名字的改动（重命名 / 复制 / 删除）挂在**右键菜单**上，页面上不再有
+// 「名称」输入框：输入框和这一列说的是同一件事（这份模板叫什么），
+// 摆两处就得同步两处；而且改名本来就是「对着某一份改」，
+// 列表才是它的自然位置。
+function paintTemplateList() {
+  const box = el('tplList');
+  box.replaceChildren();
+
+  const keyword = el('tplSearch').value.trim().toLowerCase();
+  const shown = templates.filter((t) => {
+    if (!keyword) return true;
+    // 名字和摘要一起搜：用户往往记得住「艺人」却记不住模板叫什么。
+    return t.name.toLowerCase().includes(keyword)
+      || describeTemplate(t).toLowerCase().includes(keyword);
+  });
+
+  if (!shown.length) {
+    const empty = document.createElement('div');
+    empty.className = 'tpl-empty';
+    empty.textContent = templates.length ? '没有匹配的模板。' : '还没有模板。';
+    box.appendChild(empty);
+    return;
+  }
+
+  for (const tpl of shown) {
+    const card = document.createElement('button');
+    card.className = 'tpl-item';
+    if (tpl.name === editing) card.classList.add('on');
+
+    const name = document.createElement('b');
+    name.textContent = tpl.name;
+
+    const code = document.createElement('code');
+    code.textContent = describeTemplate(tpl);
+
+    // 这里原来还给「当前模板」挂一个「当前」小标，撤掉了：
+    // 用哪一份模板由**任务页那颗下拉**现场决定，模板页选中的只是「在编辑哪一份」，
+    // 两者是两件事。标一个「当前」会让用户以为在模板页点一下就等于换了识别用的模板。
+    card.append(name, code);
+    card.onclick = () => selectTemplate(tpl.name);
+    card.oncontextmenu = (event) => {
+      event.preventDefault();
+      // 右键顺手把它选中：菜单里的三项都是对着这一份做的，
+      // 而右键落在没选中的那一份上时，用户多半以为已经选上了。
+      if (editing !== tpl.name) selectTemplate(tpl.name);
+      openTemplateMenu(tpl.name, event.clientX, event.clientY);
+    };
+    box.appendChild(card);
+  }
+}
+
+// ---------------------------------------------------------------- 右键菜单
+//
+// 自绘而不是用 WebView 原生的右键菜单：原生那份是浅色的系统样式，
+// 从这套深色界面里弹出来像另一个程序，而且它的位置由系统定，
+// 在无边框窗口里贴边弹出会被裁掉。
+//
+// 每次右键都**新建**一个节点、收起时删掉，而不是在 HTML 里预置一个壳来回切显示。
+// 预置壳的写法在无头 Chrome 的 --screenshot 里拍不到：元素在 DOM 里、有布局、
+// elementFromPoint 也命中它，但一个像素都不画（对照实验见 tools/shoot_ui.py 里
+// MENU_SHOT_JS 的注释）。新建的节点没这个毛病，截图能拍到 —— 这块 UI 才有人看得见。
+
+// menuNode 是「此刻挂着的那份菜单」，null 就是没开。
+// 用变量而不是直接查 DOM：外面点一下、按 Esc、滚动、改窗口大小都要收起来，
+// 几处都得先判断「开着吗」。
+let menuNode = null;
+
+function closeMenu() {
+  if (!menuNode) return;
+  menuNode.remove();
+  menuNode = null;
+}
+
+// openMenu 在 (x, y) 弹一个菜单。items 是 {label, danger, disabled, run}，
+// 或者 {separator: true} 画一条横线。
+function openMenu(x, y, items) {
+  closeMenu();
+
+  const menu = document.createElement('div');
+  // 留个 id：探针和截图脚本都靠它找这份菜单。
+  menu.id = 'ctxMenu';
+  menu.className = 'ctxmenu';
+
+  for (const item of items) {
+    if (item.separator) {
+      menu.appendChild(document.createElement('hr'));
+      continue;
+    }
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = item.label;
+    if (item.danger) button.classList.add('danger');
+    button.disabled = !!item.disabled;
+    button.onclick = () => { closeMenu(); item.run(); };
+    menu.appendChild(button);
+  }
+
+  // 先挂进文档再量尺寸：没挂进去的节点量出来是 0×0，夹边就白夹了。
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  document.body.appendChild(menu);
+  menuNode = menu;
+
+  // 夹回视口内。右键点在最下面一行时，菜单照原样往下展开会有一半在窗口外 ——
+  // 它没有滚动条，看不见的那几项就等于不存在。
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(6, Math.min(x, window.innerWidth - rect.width - 6)) + 'px';
+  menu.style.top = Math.max(6, Math.min(y, window.innerHeight - rect.height - 6)) + 'px';
+
+  // 第一项拿到焦点，键盘能直接上下走。
+  const first = menu.querySelector('button:not(:disabled)');
+  if (first) first.focus();
+}
+
+// 点别处 / 按 Esc / 滚动 / 改窗口大小都收起来。
+//
+// 用 mousedown 而不是 click：click 要等鼠标抬起来，中间这段时间菜单还挂着，
+// 而用户已经按下去了 —— 看着像「点了没反应」。
+window.addEventListener('mousedown', (event) => {
+  if (menuNode && !menuNode.contains(event.target)) closeMenu();
+}, true);
+window.addEventListener('blur', closeMenu);
+window.addEventListener('resize', closeMenu);
+document.addEventListener('scroll', closeMenu, true);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && menuNode) {
+    event.preventDefault();
+    closeMenu();
+  }
+});
+
+function openTemplateMenu(name, x, y) {
+  openMenu(x, y, [
+    { label: '重命名', run: () => renameTemplate(name) },
+    { label: '复制', run: () => duplicateTemplate(name) },
+    { separator: true },
+    {
+      label: '删除',
+      danger: true,
+      // 最后一份不给删。后端也会拒绝，但「按下去才报错」不如一开始就是灰的。
+      disabled: templates.length <= 1,
+      run: () => deleteTemplate(name),
+    },
+  ]);
+}
+
+// renameTemplate 改的是**后端那一份**，不是编辑器里的 draft。
+//
+// 改名和「槽位改到一半」是两件事，不该互相牵扯：正在编辑别的模板时，
+// 右键把这份改个名，不该把手上那份的改动冲掉。
+async function renameTemplate(name) {
+  const next = await askInput({
+    title: '重命名模板',
+    body: '只改名字，里面的槽位不变。',
+    value: name,
+    ok: '重命名',
+  });
+  if (!next || next === name) return;
+
+  try {
+    templates = await App.RenameTemplate(name, next);
+  } catch (error) {
+    log('ERROR', String(error));
+    return;
+  }
+
+  // 编辑器里打开的正好是这一份 → 跟着改名。
+  // 不跟的话 editing 会指向一个不存在的名字：底栏一直显示「有未保存的改动」，
+  // 而按「保存」会**把旧名字重新创建出来** —— 用户以为改了名，结果是多了一份。
+  if (editing === name) editing = next;
+
+  paintTemplateList();
+  paintTemplateSwitcher();
+  markTemplatesDirty();
+  log('INFO', `模板「${name}」已改名为「${next}」`);
+}
+
+async function duplicateTemplate(name) {
+  const next = await askInput({
+    title: '复制模板',
+    body: '复制出一份新的，原模板不动。',
+    value: name + ' 副本',
+    ok: '复制',
+  });
+  if (!next) return;
+
+  try {
+    templates = await App.DuplicateTemplate(name, next);
+  } catch (error) {
+    log('ERROR', String(error));
+    return;
+  }
+
+  paintTemplateSwitcher();
+  // 复制完直接切到新的那一份：复制多半就是为了改它，
+  // 留在原地的话用户还得回列表里找一遍。
+  selectTemplate(next);
+  log('INFO', `已复制出模板「${next}」`);
+}
+
+async function deleteTemplate(name) {
+  if (!await askConfirm({
+    title: '删除模板',
+    body: `删除模板「${name}」？这个操作不能撤销。`,
+    ok: '删除',
+    danger: true,
+  })) return;
+
+  try {
+    templates = await App.DeleteTemplate(name);
+  } catch (error) {
+    log('ERROR', String(error));
+    return;
+  }
+
+  // 删掉的正好是编辑器里打开的那一份 → 换到剩下的第一份去。
+  // 不换的话 editing 指向一个不存在的名字，按「保存」会把它重新创建出来，
+  // 用户会看到「删了怎么又回来了」。
+  if (editing === name) {
+    const next = templates.find((t) => t.active) || templates[0];
+    if (next) selectTemplate(next.name); else startNewTemplate();
+  }
+
+  paintTemplateList();
+  paintTemplateSwitcher();
+  log('INFO', `已删除模板「${name}」`);
+}
+
+function selectTemplate(name) {
+  const found = templates.find((t) => t.name === name);
+  if (!found) return;
+  editing = name;
+  draft = {
+    separator: found.separator || templateOptions.defaultSeparator,
+    slots: (found.slots || []).map(cloneSlot),
+  };
+  el('tplSep').value = draft.separator;
+  renderSlotList();
+  paintTemplateList();
+  paintTplPreview();
+  markTemplatesDirty();
+}
+
+function startNewTemplate() {
+  // editing = null 就是「这份还没存过」的唯一标记，名字在按保存时才问。
+  editing = null;
+  draft = {
+    separator: templateOptions.defaultSeparator,
+    // 给一格歌名起手，省得新建之后是一片空白。
+    slots: [blankSlot()],
+  };
+  el('tplSep').value = draft.separator;
+  renderSlotList();
+  paintTemplateList();
+  paintTplPreview();
+  markTemplatesDirty();
+}
+
+// 底栏左边那行状态。参考图里写的是「已保存，更新于 …」——
+// 与其显示一个没人看的绝对时间，不如说清「现在有没有没保存的东西」。
+function markTemplatesDirty() {
+  const stored = editing === null ? null : templates.find((t) => t.name === editing);
+
+  // 分组标题右边那一行：先说清「正在编辑的这份是什么」。
+  el('tplKind').textContent = editing === null
+    ? '新模板，还没保存'
+    : (stored && stored.active ? '当前使用的模板' : '未在使用');
+
+  if (editing === null) {
+    setFootState('tplState', 'warn', '新模板还没保存');
+    return;
+  }
+  // 名字不参与比较：它现在只能在左栏右键改，改完 editing 就跟着换了，
+  // 拿它来算「有没有未保存的改动」永远为假，是句废话。
+  const changed = !stored
+    || (stored.separator || '') !== draft.separator
+    || !sameSlots(stored.slots || [], draft.slots);
+  if (changed) setFootState('tplState', 'warn', '有未保存的改动');
+  else setFootState('tplState', 'ok', '已保存');
+}
+
+function sameSlots(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = cloneSlot(a[i]);
+    const y = cloneSlot(b[i]);
+    if (x.var !== y.var || x.script !== y.script || x.text !== y.text
+      || x.prefix !== y.prefix || x.suffix !== y.suffix
+      || x.separator !== y.separator) return false;
+  }
+  return true;
+}
+
+function setFootState(id, state, text) {
+  const node = el(id);
+  node.className = 'foot-state' + (state ? ' ' + state : '');
+  node.textContent = text;
+}
+
+async function loadTemplateOptions() {
+  try {
+    templateOptions = await App.TemplateEditorOptions();
+  } catch (error) {
+    log('ERROR', '读模板选项失败：' + error);
+    return;
+  }
+}
+
+async function loadTemplates() {
+  try {
+    templates = await App.Templates();
+  } catch (error) {
+    log('ERROR', '读模板失败：' + error);
+    return;
+  }
+  const active = templates.find((t) => t.active) || templates[0];
+  if (active) selectTemplate(active.name);
+  else startNewTemplate();
+  paintTemplateSwitcher();
+}
+
+function paintTemplateSwitcher() {
+  const select = el('selTemplate');
+  select.replaceChildren();
+  for (const tpl of templates) {
+    const option = document.createElement('option');
+    option.value = tpl.name;
+    option.textContent = tpl.name;
+    select.appendChild(option);
+  }
+  const active = templates.find((t) => t.active);
+  if (active) select.value = active.name;
+}
+
+el('tplSep').oninput = () => {
+  draft.separator = el('tplSep').value;
+  paintTplPreview();
+  markTemplatesDirty();
+};
+el('tplPrefix').oninput = () => {
+  // 未识别前缀只影响「完全没识别到」那一条预览。
+  paintTplPreview();
+};
+el('tplSearch').oninput = paintTemplateList;
+el('btnNewTemplate').onclick = startNewTemplate;
+el('btnAddSlot').onclick = addSlot;
+
+// 底栏只剩「保存」。
+//
+// 「恢复内置模板」和「设为当前」两颗按 Majo 的要求撤掉了：
+// 用哪份模板由任务页那颗下拉现场决定，模板页不需要再放一个开关。
+// 「删除」挪进左栏右键菜单，「名称」输入框一并去掉 —— 它和左栏说的是同一件事。
+el('btnSaveTemplate').onclick = async () => {
+  if (!draft.slots.length) { log('WARN', '至少要留一段'); return; }
+
+  // 新模板到这一步才问名字。以前是页面上先有个「名称」框，
+  // 但现在名字只在左栏右键里改 —— 新建这一路必须补一次询问，
+  // 否则「新建 → 保存」会拿空名字去后端换一句「模板名不能是空的」。
+  let name = editing;
+  if (name === null) {
+    name = await askInput({
+      title: '保存模板',
+      body: '给这份新模板起个名字。',
+      value: '',
+      placeholder: '比如「艺人 - 歌名」',
+      ok: '保存',
+    });
+    if (!name) { log('WARN', '没起名字，模板没保存'); return; }
+  }
+
+  try {
+    templates = await App.SaveTemplate({
+      name,
+      separator: el('tplSep').value,
+      slots: draft.slots,
+    });
+    editing = name;
+    selectTemplate(name);
+    paintTemplateSwitcher();
+    log('INFO', '模板「' + name + '」已保存');
+  } catch (error) {
+    log('ERROR', '保存失败：' + error);
+  }
+};
+
+el('selTemplate').onchange = async (e) => {
+  try {
+    templates = await App.SetActiveTemplate(e.target.value);
+    const active = templates.find((t) => t.active);
+    if (active) selectTemplate(active.name);
+    log('INFO', '命名模板已切换为「' + e.target.value + '」');
+  } catch (error) {
+    log('ERROR', String(error));
+    paintTemplateSwitcher();
+  }
+};
+
+// ---------------------------------------------------------------- 记录
+
+// pathCell 只显示文件名，完整路径放 title。
+//
+// 记录里存的是完整路径，但两列的目录部分永远一样，整条铺出来反而看不出
+// 「名字到底被改成了什么」——真正的差异全挤在最后几个字上。
+function pathCell(path, className) {
+  const td = cell(String(path || '').split(/[\\/]/).pop(), className);
+  td.title = path;
+  return td;
+}
+
+// historyNowCell 是「现名」那一格。
+//
+// 绝大多数时候文件就在记录里那个名字上，这一格和别处没两样。
+// 但用户在资源管理器里手动改过名之后，文件实际在**另一个**名字上 ——
+// 后端按文件身份认出了它（见 internal/job 的 fileIdentity），
+// 这里要如实显示，否则用户看到的是一个磁盘上不存在的文件名，会以为文件没了。
+//
+// 已还原的记录不算「被改过名」：那种记录的文件本来就已经被改回原名了，
+// nowPath 当然和 to 不一样 —— 那是还原的结果，不是外部改名。
+function historyNowCell(entry) {
+  const actual = entry.nowPath || entry.to;
+  const moved = !entry.restored
+    && String(actual).toLowerCase() !== String(entry.to).toLowerCase();
+
+  const td = cell(String(actual).split(/[\\/]/).pop(), 'mono');
+  td.title = moved ? actual + '\n（记录里是 ' + entry.to + '）' : actual;
+  if (!moved) return td;
+
+  const tag = document.createElement('span');
+  tag.className = 'moved';
+  tag.textContent = '已改名';
+  td.appendChild(tag);
+  return td;
+}
+
+// historyState 把一条记录归成三种状态。
+//
+// 不做成「在 / 已不在」两态：还原过的文件，现名自然不在磁盘上了，
+// 跟「文件被挪走了」混成同一个说法，用户会以为还原没生效。
+function historyState(entry) {
+  if (entry.restored) return cell('已还原', 'muted');
+  if (entry.exists) return cell('可还原');
+  return cell('已不在', 'muted');
+}
+
+// historyOps 画出那颗「还原」按钮。
+//
+// 已经还原过、或者文件已经不在的，干脆不给按钮——按下去也只会得到
+// 一句「文件已不在」，不如一开始就说明白。
+function historyOps(entry) {
+  const td = document.createElement('td');
+  if (!canRestore(entry)) return td;
+
+  const button = document.createElement('button');
+  button.textContent = '还原';
+  button.title = '改回「' + entry.from + '」';
+  button.onclick = () => restoreOne(entry.to, button);
+  td.appendChild(button);
+  return td;
+}
+
+// canRestore 只有「现名还在磁盘上、而且没还原过」的记录才动得了。
+//
+// 三种状态里只有这一种是「能还原」。另外两种按下去也只会得到
+// 「文件已不在」或者「已经还原过了」——那就不该给按钮、也不该给勾选框。
+function canRestore(entry) {
+  return !!entry.exists && !entry.restored;
+}
+
+// ---------------------------------------------------------- 勾选与筛选
+//
+// 勾选集合装的是 entry.to（现名的完整路径），不是行号：
+// 行号会随筛选、刷新、还原重排，拿它当钥匙迟早对不上。
+//
+// 同一个 to 在列表里可能出现在好几行（同一个文件被改过不止一次），
+// 那时几行会一起勾上。这跟后端的行为是一致的：一批里同一个 to 只还原最新的那条，
+// 所以「勾了几行」和「会动几个文件」本来就不是一回事，界面上按**去重后的条数**算。
+
+let historyEntries = [];
+const historyPicked = new Set();
+
+// historyMatches 一条记录过不过当前的筛选和搜索。
+//
+// 三种状态互斥：已还原 / 可还原 / 已不在。已还原的记录现名当然不在磁盘上，
+// 所以「已不在」这一档必须显式排掉 restored，否则它会同时出现在两档里。
+function historyMatches(entry, mode, needle) {
+  if (mode === 'undoable' && !canRestore(entry)) return false;
+  if (mode === 'restored' && !entry.restored) return false;
+  if (mode === 'missing' && (entry.restored || entry.exists)) return false;
+  if (!needle) return true;
+  // 搜整条路径，不只搜文件名：用户多半记得「D:\演唱会\那一批」，
+  // 而记不住当时被改成什么名字。
+  //
+  // nowPath 也要搜：文件被手动改过名之后，用户想搜的往往就是**他现在看到
+  // 的那个名字** —— 而记录里的现名早就不是它了。
+  return (entry.from + '\n' + entry.to + '\n' + (entry.nowPath || ''))
+    .toLowerCase().includes(needle);
+}
+
+// paintHistoryBar 按当前看得见的那批行更新计数、全选框和按钮。
+//
+// 这里**故意不做**「把已经不在列表里的勾选剪掉」那一步。试过，删了：
+// 剪枝和 restorePicked 里那句「目标从可见行推导」是两套等价的安全机制，
+// 留着两套的结果是——把其中任何一套删掉，测试都照样通过（另一套兜住了）。
+// 两套都拦得住的东西，等于两套都没被验过。
+//
+// 留下的是在使用点强制的那一套（restorePicked），因为它不依赖
+// 「某个渲染一定先跑过」这种时序假设。代价是被筛掉的勾选会留着：
+// 搜索清空之后，原来勾的那几条还是勾着的。这是可以接受的 ——
+// 数字始终等于屏幕上勾着的行数，只是会随筛选回来。
+function paintHistoryBar(rows) {
+  const pickable = rows.filter(canRestore);
+  const picked = pickable.filter((entry) => historyPicked.has(entry.to)).length;
+
+  el('btnUndoSelected').disabled = picked === 0;
+  el('btnUndoSelected').textContent = picked ? `还原所选（${picked}）` : '还原所选';
+
+  // 全选框只管**当前筛出来的可还原项**。用 indeterminate 表示「勾了一部分」：
+  // 不表示出来的话，用户看到空框会以为自己的勾选被清掉了。
+  const all = el('histAll');
+  all.disabled = pickable.length === 0;
+  all.checked = pickable.length > 0 && picked === pickable.length;
+  all.indeterminate = picked > 0 && picked < pickable.length;
+
+  el('histCount').textContent = rows.length === historyEntries.length
+    ? `${historyEntries.length} 条`
+    : `显示 ${rows.length} / ${historyEntries.length} 条`;
+}
+
+// syncHistoryPicks 只把勾选状态同步到表头那颗全选框和按钮上，不重画整张表。
+//
+// 重画会丢掉键盘焦点，长列表还要白算一遍 —— 勾一个框只需要更新那几处汇总。
+function syncHistoryPicks() {
+  for (const box of el('histBody').querySelectorAll('input[type=checkbox][data-to]')) {
+    box.checked = historyPicked.has(box.dataset.to);
+  }
+  paintHistoryBar(visibleHistoryRows());
+}
+
+// historyPickCell 画出那一格的勾选框。
+function historyPickCell(entry) {
+  const td = document.createElement('td');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.dataset.to = entry.to;
+
+  if (!canRestore(entry)) {
+    // 勾不了的就别给勾：勾了也只会得到一句「跳过」，
+    // 而用户会以为这一批能救回来。
+    box.disabled = true;
+    box.title = entry.restored ? '这条已经还原过了' : '现名那个文件已经不在磁盘上';
+    td.appendChild(box);
+    return td;
+  }
+
+  box.checked = historyPicked.has(entry.to);
+  box.title = '勾上这条，再点右边的「还原所选」一起改回去';
+  box.onchange = () => {
+    if (box.checked) historyPicked.add(entry.to);
+    else historyPicked.delete(entry.to);
+    syncHistoryPicks();
+  };
+  td.appendChild(box);
+  return td;
+}
+
+// restoreOne 把单个文件改回原名。
+//
+// 不做二次确认：一次只动一个文件，而且点错了重跑一遍就能改回来。
+// 真正会「一不小心改一片」的是旁边那颗「撤销全部改名」，那颗有确认。
+async function restoreOne(to, button) {
+  button.disabled = true;
+  try {
+    const result = await App.UndoOne(to);
+    log('INFO', `还原：成功 ${result.restored}，找不到 ${result.missing}，跳过 ${result.skipped}`);
+    // 没还原成的原因（原名被占用 / 文件已不在）后端写在 details 里，
+    // 不转出来用户就只看到「成功 0」。
+    (result.details || []).forEach((d) => log('WARN', d));
+    await refreshAfterRestore();
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+  loadHistory();
+}
+
+// restorePicked 把勾上的记录一起还原。
+//
+// 目标是从**当前看得见的那批行**里算出来的，不是直接把 historyPicked 丢给后端。
+// 这是整页的安全线：只要目标由屏幕上这一批推出来，「按钮上的数字」和
+// 「真正会动的文件」就必然相等 —— 哪怕集合里残留着已经被筛掉的路径
+// （搜索把其中几条藏起来就是这种情况），也带不进这次还原。
+//
+// 不做二次确认：「一键还原」要的就是按一下就完事，而且勾哪几条本身就是确认 ——
+// 按钮上那个数字会随勾选实时变，按下去之前用户看得到会动几个。
+// 真正无边界的是旁边那颗「撤销全部改名」，那颗有确认。
+async function restorePicked() {
+  const targets = visibleHistoryRows()
+    .filter(canRestore)
+    .map((entry) => entry.to)
+    .filter((to) => historyPicked.has(to));
+  if (!targets.length) return;
+
+  const button = el('btnUndoSelected');
+  button.disabled = true;
+  try {
+    const result = await App.UndoMany(targets);
+    log('INFO', `批量还原 ${targets.length} 条：成功 ${result.restored}，` +
+      `找不到 ${result.missing}，跳过 ${result.skipped}`);
+    (result.details || []).forEach((d) => log('WARN', d));
+    await refreshAfterRestore();
+  } catch (error) {
+    // 「勾的全是已还原过的」也走这里 —— 后端故意把它当错误报，
+    // 就是为了不出现「按下去什么都没发生、日志里也没有」。
+    log('ERROR', String(error));
+  }
+  historyPicked.clear();
+  loadHistory();
+}
+
+// visibleHistoryRows 当前筛选和搜索之下看得见的那批记录。
+//
+// 抽出来是因为「什么算看得见」现在有三个消费者：画表格的、更新汇总栏的、
+// 以及决定「按下去会动哪些文件」的。三处各写一遍迟早会分叉 ——
+// 而分叉的方向恰好是「按钮说 1 个、实际动 3 个」。
+function visibleHistoryRows() {
+  const mode = el('histFilter').value;
+  const needle = el('histSearch').value.trim().toLowerCase();
+  return historyEntries.filter((entry) => historyMatches(entry, mode, needle));
+}
+
+// refreshAfterRestore 还原之后把队列重新扫一遍。
+//
+// 不扫的话列表里还留着改名后的名字，用户会以为还原没生效 ——
+// 而文件其实已经改回去了。
+async function refreshAfterRestore() {
+  const list = await App.Items();
+  if (list.length) scanPath(list[0].dir);
+}
+
+function renderHistory() {
+  const body = el('histBody');
+  body.replaceChildren();
+
+  const rows = visibleHistoryRows();
+
+  el('histWrap').style.display = rows.length ? 'block' : 'none';
+
+  // 两种「空」要分开说：一条记录都没有，和筛完没剩下。
+  // 混成一句的话，用户打错一个字会以为记录被清空了。
+  const empty = el('histEmpty');
+  empty.style.display = rows.length ? 'none' : 'flex';
+  const none = historyEntries.length === 0;
+  el('histEmptyTitle').textContent = none ? '还没有改名记录' : '没有符合条件的记录';
+  el('histEmptyNote').textContent = none
+    ? '每次改名都会记一行，还原就是照这份记录倒着改回去。'
+    : '换个关键词，或者把筛选切回「全部」。';
+
+  for (const entry of rows) {
+    const tr = document.createElement('tr');
+    tr.append(
+      historyPickCell(entry),
+      cell(formatTime(entry.ts)),
+      pathCell(entry.from, 'mono muted'),
+      historyNowCell(entry),
+      historyState(entry),
+      historyOps(entry),
+    );
+    body.appendChild(tr);
+  }
+
+  paintHistoryBar(rows);
+}
+
+async function loadHistory() {
+  try {
+    historyEntries = (await App.History()) || [];
+  } catch (error) {
+    log('ERROR', String(error));
+    historyEntries = [];
+  }
+  renderHistory();
+}
+
+el('btnRefreshHistory').onclick = loadHistory;
+
+// 搜索和筛选只改「看得见哪些」，**不清空勾选**。
+//
+// 清空是最省事的写法，但没必要：安全靠的是 restorePicked 里那个推导 ——
+// 它保证送出去的永远只是「此刻看得见、可还原」的那几条。既然危险在那儿已经挡住了，
+// 再无条件清一遍就只是白扔掉用户刚勾好的东西：
+// 勾了三条 → 想换个词再看看 → 三条全没了，得重新勾。
+//
+// 所以这里的行为是：勾选一直留着（哪怕被筛掉），
+// 而按钮上的数字始终等于屏幕上勾着的行数，按下去也只动那些。
+el('histSearch').oninput = renderHistory;
+el('histFilter').onchange = renderHistory;
+
+el('histAll').onchange = () => {
+  const pickable = visibleHistoryRows().filter(canRestore);
+
+  // 只动当前看得见的那批，不碰别的：全选框在筛选之后显示的是「这一批」的状态，
+  // 取消勾选却把看不见的也一起清掉，那就对不上了。
+  if (el('histAll').checked) pickable.forEach((entry) => historyPicked.add(entry.to));
+  else pickable.forEach((entry) => historyPicked.delete(entry.to));
+  syncHistoryPicks();
+};
+
+el('btnUndoSelected').onclick = restorePicked;
+
+el('btnUndoAll').onclick = async () => {
+  if (!await askConfirm({
+    title: '撤销全部改名',
+    body: '按改名记录把文件名全部改回去。\n已经在磁盘上挪走或删掉的文件会跳过。',
+    ok: '全部撤销',
+    danger: true,
+  })) return;
+  try {
+    const result = await App.Undo();
+    log('INFO', `撤销：还原 ${result.restored}，找不到 ${result.missing}，跳过 ${result.skipped}`);
+    (result.details || []).forEach((d) => log('WARN', d));
+    // 全撤销之后勾选一律作废：那些行全都变成「已还原」，留着只会让
+    // 「还原所选」上挂着一个按不动的数字。
+    historyPicked.clear();
+    await refreshAfterRestore();
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+  loadHistory();
+};
+
+// ---------------------------------------------------------------- 设置
+
+function fillSettings(cfg) {
+  settings = cfg;
+  el('cfgSegment').value = cfg.segment_seconds;
+  el('cfgConcurrency').value = cfg.concurrency;
+  el('cfgRetries').value = cfg.retries;
+  el('cfgTimeout').value = cfg.timeout_seconds;
+  el('cfgLanguage').value = cfg.language;
+  el('cfgCountry').value = cfg.country;
+  el('cfgExtensions').value = (cfg.extensions || []).join(', ');
+  el('cfgRecursive').checked = !!cfg.recursive;
+  el('cfgSkip').checked = !!cfg.skip_processed;
+  el('cfgDryRun').checked = !!cfg.dry_run;
+  el('cfgCloseToTray').checked = cfg.close_to_tray !== false;
+  el('cfgUAEnabled').checked = !!cfg.user_agent;
+  el('cfgUserAgent').value = cfg.user_agent || '';
+  el('cfgUserAgent').disabled = !cfg.user_agent;
+  el('cfgFFmpeg').value = cfg.ffmpeg_path || '';
+  el('cfgProxy').value = cfg.proxy || '';
+  // 刚读到的配置没测过，别把上一次的结论留在这儿。
+  setSource(el('proxyState'), '', '—');
+
+  el('tplPrefix').value = cfg.unmatched_prefix || '';
+  el('tplSuffix').value = cfg.unmatched_suffix || '';
+  el('tplMaxRunes').value = cfg.max_name_runes;
+
+  el('winClose').title = cfg.close_to_tray === false ? '关闭并退出' : '关闭到托盘';
+  paintTplPreview();
+  // 这里全是直接给 .value 赋值，不会触发 input 事件，
+  // 所以增减按钮的置灰状态得手动补一次（保存后也会走这条路）。
+  paintAllNumberSteps();
+  // 刚填进去的值就是磁盘上的值，底栏如实写「已保存」。
+  setFootState('cfgState', 'ok', '已保存');
+}
+
+el('cfgUAEnabled').onchange = (e) => {
+  el('cfgUserAgent').disabled = !e.target.checked;
+  if (e.target.checked) el('cfgUserAgent').focus();
+  markSettingsDirty();
+};
+
+// 左列分组导航：点一下只显示那一组。
+// 六个分组摊成一长条时，用户得滚着找「ffmpeg 在哪」；分组之后一屏就是一件事。
+function showSettingsGroup(name) {
+  for (const button of document.querySelectorAll('#setNav .wsg')) {
+    button.classList.toggle('active', button.dataset.group === name);
+  }
+  for (const group of document.querySelectorAll('#setScroll .set-group')) {
+    group.classList.toggle('hidden', group.dataset.group !== name);
+  }
+  el('setScroll').scrollTop = 0;
+}
+
+for (const button of document.querySelectorAll('#setNav .wsg')) {
+  button.onclick = () => showSettingsGroup(button.dataset.group);
+}
+
+// 把表单里的值收成一个配置对象。
+// 抽出来是为了让「保存」和「有没有改动」用同一份逻辑 ——
+// 两份各写一遍的话，加了新字段忘了同步，底栏会一直显示「已保存」。
+function collectSettings() {
+  return {
+    ...settings,
+    segment_seconds: Number(el('cfgSegment').value),
+    concurrency: Number(el('cfgConcurrency').value),
+    retries: Number(el('cfgRetries').value),
+    timeout_seconds: Number(el('cfgTimeout').value),
+    language: el('cfgLanguage').value.trim(),
+    country: el('cfgCountry').value.trim(),
+    extensions: el('cfgExtensions').value.split(/[,，\s]+/).filter(Boolean),
+    recursive: el('cfgRecursive').checked,
+    skip_processed: el('cfgSkip').checked,
+    dry_run: el('cfgDryRun').checked,
+    close_to_tray: el('cfgCloseToTray').checked,
+    user_agent: el('cfgUAEnabled').checked ? el('cfgUserAgent').value.trim() : '',
+    ffmpeg_path: el('cfgFFmpeg').value.trim(),
+    proxy: el('cfgProxy').value.trim(),
+    unmatched_prefix: el('tplPrefix').value,
+    unmatched_suffix: el('tplSuffix').value,
+    max_name_runes: Number(el('tplMaxRunes').value),
+  };
+}
+
+// 只比较「这份表单管得着的字段」。模板库、当前模板这些不在这页改，
+// 拿它们参与比较会让底栏永远显示「有未保存的改动」。
+const SETTINGS_KEYS = [
+  'segment_seconds', 'concurrency', 'retries', 'timeout_seconds',
+  'language', 'country', 'extensions', 'recursive', 'skip_processed',
+  'dry_run', 'close_to_tray', 'user_agent', 'ffmpeg_path', 'proxy',
+  'unmatched_prefix', 'unmatched_suffix', 'max_name_runes',
+];
+
+function markSettingsDirty() {
+  if (!settings) return;
+  const draft = collectSettings();
+  const changed = SETTINGS_KEYS.some((key) => {
+    const a = draft[key];
+    const b = settings[key];
+    return Array.isArray(a) || Array.isArray(b)
+      ? JSON.stringify(a || []) !== JSON.stringify(b || [])
+      : a !== b;
+  });
+  setFootState('cfgState', changed ? 'warn' : 'ok', changed ? '有未保存的改动' : '已保存');
+}
+
+// 表单里任何一处改动都重新算一遍。capture 阶段监听，省得逐个控件挂。
+el('setScroll').addEventListener('input', markSettingsDirty, true);
+el('setScroll').addEventListener('change', markSettingsDirty, true);
+// 「未识别命名」也在底栏的保存范围内，但它长在模板页。
+el('tplPrefix').addEventListener('input', markSettingsDirty);
+el('tplSuffix').addEventListener('input', markSettingsDirty);
+el('tplMaxRunes').addEventListener('input', markSettingsDirty);
+
+el('btnPickFFmpeg').onclick = async () => {
+  try {
+    const path = await App.PickFFmpeg();
+    if (path) {
+      el('cfgFFmpeg').value = path;
+      markSettingsDirty();
+    }
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+};
+
+el('btnClearFFmpeg').onclick = () => {
+  el('cfgFFmpeg').value = '';
+  markSettingsDirty();
+};
+
+el('btnRedetect').onclick = async () => {
+  el('btnRedetect').disabled = true;
+  try {
+    await refreshCheck();
+  } finally {
+    el('btnRedetect').disabled = false;
+  }
+};
+
+// 填 `-` 而不是留空。留空是「跟随 HTTP_PROXY / HTTPS_PROXY」，那是另一件事：
+// 一个想绕开系统代理的用户，按「留空」是绕不开的。
+el('btnProxyDirect').onclick = () => {
+  el('cfgProxy').value = '-';
+  markSettingsDirty();
+  el('cfgProxy').focus();
+};
+
+// 地址一改，上一次的测试结论就不作数了。留着一个绿色的「连接正常」配一个
+// 刚被改掉的地址，比什么都不显示更容易误导。
+el('cfgProxy').addEventListener('input', () => {
+  setSource(el('proxyState'), '', '—');
+});
+
+el('btnTestNetwork').onclick = async () => {
+  const button = el('btnTestNetwork');
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = '测试中…';
+  setSource(el('proxyState'), '', '正在连接…');
+  try {
+    const check = await App.TestNetwork(el('cfgProxy').value.trim());
+    if (check.ok) {
+      setSource(el('proxyState'), 'ok',
+        `连接正常 · ${check.proxy} · HTTP ${check.http_status} · ${check.elapsed_ms} ms`);
+    } else {
+      setSource(el('proxyState'), 'err', `${check.proxy}：${check.error || '连接失败'}`);
+      log('ERROR', '代理测试失败：' + (check.error || '未知原因'));
+    }
+  } catch (error) {
+    setSource(el('proxyState'), 'err', String(error));
+    log('ERROR', '代理测试失败：' + error);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+};
+
+el('btnSaveSettings').onclick = async () => {
+  if (!settings) return;
+  try {
+    settings = await App.SaveConfig(collectSettings());
+    fillSettings(settings);
+    await refreshCheck();
+    log('INFO', '设置已保存');
+  } catch (error) {
+    log('ERROR', '保存失败：' + error);
+  }
+};
+
+el('btnOpenLog').onclick = () => App.OpenLog().catch((e) => log('ERROR', String(e)));
+el('btnOpenDir').onclick = () => App.OpenConfigFolder().catch((e) => log('ERROR', String(e)));
+
+// ---------------------------------------------------------------- 数字输入框
+
+// 把每个 input[type=number] 的原生增减按钮换成自己画的 − / +。
+//
+// 原生那对三角是浏览器按系统主题绘制的，CSS 里给它写 background / color 没有用，
+// 在深色界面上就是一对浅灰异物（用户点名提过）。
+//
+// 包装方式是**在原有 input 外面套一层**：input 本身和它的 id 都不动，
+// 所以满页面的 el('cfgSegment').value 之类取值逻辑一行都不用改。
+function enhanceNumberInputs() {
+  for (const input of document.querySelectorAll('input[type=number]')) {
+    if (input.parentElement && input.parentElement.classList.contains('numwrap')) continue;
+
+    const box = document.createElement('span');
+    box.className = 'numwrap';
+    input.parentNode.insertBefore(box, input);
+    box.appendChild(input);
+
+    const step = document.createElement('span');
+    step.className = 'numstep';
+    for (const [direction, glyph, title] of [[-1, '−', '减 1'], [1, '+', '加 1']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'numbtn';
+      button.textContent = glyph;
+      button.title = title;
+      // 不让它进 Tab 序列：输入框本身才是主体，两个按钮是辅助。
+      button.tabIndex = -1;
+      button.onclick = () => bumpNumber(input, direction);
+      step.appendChild(button);
+    }
+    box.appendChild(step);
+  }
+  paintAllNumberSteps();
+}
+
+// bumpNumber 按 min / max / step 走一步。
+//
+// **必须手动派发 input 事件**：直接改 .value 不会触发任何监听器，
+// 而这些输入框是靠 oninput 去 markSettingsDirty() 的 ——
+// 不派发的话值改了界面不认，保存下去的还是旧的。
+function bumpNumber(input, direction) {
+  const min = input.min === '' ? -Infinity : Number(input.min);
+  const max = input.max === '' ? Infinity : Number(input.max);
+  const stepValue = input.step === '' || input.step === 'any' ? 1 : Number(input.step);
+
+  const current = Number(input.value);
+  const base = Number.isFinite(current) ? current : (Number.isFinite(min) ? min : 0);
+  const next = Math.min(max, Math.max(min, base + direction * stepValue));
+  if (next === current) {
+    paintNumberSteps(input);
+    return;
+  }
+
+  input.value = String(next);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  paintNumberSteps(input);
+}
+
+// 到顶 / 到底就把对应的按钮置灰，否则点着没反应，看起来像坏了。
+function paintNumberSteps(input) {
+  const box = input.closest('.numwrap');
+  if (!box) return;
+
+  const min = input.min === '' ? -Infinity : Number(input.min);
+  const max = input.max === '' ? Infinity : Number(input.max);
+  const value = Number(input.value);
+  const buttons = box.querySelectorAll('.numbtn');
+  if (buttons.length !== 2) return;
+
+  buttons[0].disabled = Number.isFinite(min) && value <= min;
+  buttons[1].disabled = Number.isFinite(max) && value >= max;
+}
+
+// fillSettings 是直接给 .value 赋值的，不会触发 input 事件，
+// 所以填完之后要显式刷一遍按钮状态。
+function paintAllNumberSteps() {
+  for (const input of document.querySelectorAll('input[type=number]')) paintNumberSteps(input);
+}
+
+// ---------------------------------------------------------------- 启动
+
+async function boot() {
+  setRunning(false);
+  paintMaxIcon();
+  showSettingsGroup('recognize');
+  syncSelectionUI();
+  renderProgress({});
+
+  // 先包好增减按钮，再填值。反过来的话按钮的置灰状态会按空值算一次，
+  // 得再补一次刷新。
+  enhanceNumberInputs();
+
+  await refreshCheck();
+
+  fillSettings(await App.GetConfig());
+  // 模板选项（变量名、语种名、分隔符候选）要先拿到，
+  // 否则模板列表画出来的槽位下拉框会是空的。
+  await loadTemplateOptions();
+  await loadTemplates();
+
+  const list = await App.Items();
+  if (list && list.length) rebuild(list);
+  // 空队列时上面那句不会调 rebuild，而 rebuild 是**唯一**会切「表格 / 空状态」的地方。
+  // 不补这一句，两个面板会同时显示：表格只剩表头 + 一片空行，空状态又整块跟在下面，
+  // 各自带一条 1px 边框 —— 用户看到的就是「中间多了一条分割线，面板像被切成两半」。
+  refreshEmptyState();
+  renderProgress(await App.Progress());
+  await loadHistory();
+
+  // 明确的「启动完成」信号。截图脚本靠它判断页面真的渲染完了，
+  // 比盯着某段文案猜可靠。
+  document.documentElement.dataset.boot = 'done';
+}
+
+boot().catch((error) => {
+  log('ERROR', String(error));
+  document.documentElement.dataset.boot = 'failed';
+});
+</script>
+</body>
+</html>

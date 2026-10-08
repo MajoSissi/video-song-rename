@@ -1,0 +1,134 @@
+# 手动构建：在 Actions 页面点一下「Run workflow」，产出可直接下载的 exe。
+#
+# 为什么只做手动触发，不挂 push / pull_request：
+# 这个仓库的构建要跑一遍 Rust（`sidecar/target/` 有 1.4 GB）再跑一遍 Go，
+# 一次几分钟。每次推送都跑，等于把 Actions 额度烧在「本地反正也要跑一遍」的事情上；
+# 而真正需要的是一个**确定性的、换台机器也能重现的**构建 ——
+# 给某个人一个能跑的 exe、或者确认「我这台机器上的环境没问题」。
+#
+# 想在合并前先验一遍的话，在 on: 下面临时加一行 `pull_request:` 就行，其余不用动。
+name: 手动构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 构建模式（debug 会保留控制台窗口并带上 DevTools）
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - debug
+
+# 只读就够：这个流程只 checkout、构建、上传 artifact，不写回仓库。
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建 ${{ inputs.mode }}
+    # 产物是 Windows exe，只能在 Windows 上编。
+    runs-on: windows-latest
+    # 默认上限 360 分钟太宽。Rust 第一次编（没命中缓存）十几分钟，
+    # 45 分钟够用，卡住时能早点失败而不是白等一小时。
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      # 版本号从 go.mod 里读，别在这里再写一遍：
+      # 两处各写一份迟早会对不上，而对不上的表现是「本地能编、CI 报语法错误」。
+      - name: 装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 仓库里没有 rust-toolchain 文件，所以跟 stable 走。
+      - name: 装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # sidecar/target 有 1.4 GB，这一项对构建时间的影响最大。
+      - name: 缓存 Rust 产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar
+
+      # rsrc_windows_amd64.syso 不在版本库里（见 .gitignore），得先生成。
+      # build.sh 里也会跑一次 —— 这里显式留一步，是因为缺了它编出来的 exe
+      # 没有自定义图标，**而且不报任何错**。
+      - name: 生成 exe 图标与版本资源
+        run: go run tools/genrsrc.go
+
+      # 直接复用本地那个 build.sh，不在这里重抄一遍命令。
+      # 抄一遍的代价是「CI 编出来的和本地不是同一份」，而且以后要改两处。
+      # windows-latest 上 `shell: bash` 走的是 Git Bash，
+      # build.sh 里的 `set -euo pipefail` / `[[ ]]` / `$( )` 它都认。
+      #
+      # 写成 `bash ./build.sh` 而不是 `./build.sh`：Windows 上 Git 默认
+      # `core.filemode=false`，可执行位进不了索引，靠 `./` 直接跑可能
+      # 在 runner 上报 Permission denied。显式叫 bash 就与文件模式无关了。
+      - name: 构建
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [[ "$MODE" == "debug" ]]; then
+            bash ./build.sh --debug
+          else
+            bash ./build.sh
+          fi
+
+      # 只验「文件在不在」是不够的：忘了带 `-tags production` 的话，
+      # Wails 会编出一个能启动但什么都不做的空壳，而且**尺寸明显偏小**
+      # （桩 5.4 MB，真身 12 MB）。这是这个项目最容易踩、又最不容易一眼看出来的坑，
+      # 所以在这里按尺寸卡一道 —— 一个编坏了的 exe 比没有 exe 更糟。
+      - name: 校验产物
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+
+          for f in dist/video-song-rename.exe dist/shazam-sidecar.exe; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error::缺产物：$f"
+              exit 1
+            fi
+          done
+
+          ui=$(stat -c %s dist/video-song-rename.exe)
+          side=$(stat -c %s dist/shazam-sidecar.exe)
+          echo "界面 exe：$ui 字节"
+          echo "sidecar：$side 字节"
+
+          if [[ "$MODE" == "release" ]] && (( ui < 10000000 )); then
+            echo "::error::界面 exe 只有 $ui 字节（release 通常 12 MB 上下）—— -tags production 大概没生效，编出来的是 Wails 的空壳"
+            exit 1
+          fi
+
+          {
+            echo "### 构建产物（$MODE）"
+            echo
+            echo "| 产物 | 大小 |"
+            echo "|---|---|"
+            echo "| video-song-rename.exe | $ui 字节 |"
+            echo "| shazam-sidecar.exe | $side 字节 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-song-rename-${{ inputs.mode }}
+          # 只传这两个 exe，**不要传整个 dist/**：那里的 dist/data/ 是运行时
+          # 写出来的配置和日志（本地跑过一次就会在里面），打进去等于把
+          # 自己的设置和文件路径一起发出去。
+          path: |
+            dist/video-song-rename.exe
+            dist/shazam-sidecar.exe
+          # 上面已经逐个验过存在性了，这里再兜一道：
+          # 路径写错时 artifact 会静默变成空的，而下载的人只会看到一个空包。
+          if-no-files-found: error
+          retention-days: 30

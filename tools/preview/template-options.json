@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "模板编辑器的槽位下拉目录。**唯一权威在 Go**（internal/naming 的 choices / Separators）。",
+    "这个文件是给两个静态预览桩用的：它们跑在浏览器里，没有 Go 运行时。",
+    "复制躲不掉，所以让两份桩共用**同一个**副本，并由 frontend_contract_test.go",
+    "里的 TestStubTemplateOptionsMatchGo 逐项比对 —— 漂移会直接变红。",
+    "改 Go 那边的清单时必须同步改这里，否则测试会报出具体差在哪一项。",
+    "choices 的顺序就是下拉框里的显示顺序，也要一致。"
+  ],
+  "choices": [
+    { "var": "title", "label": "原版歌名", "group": "歌名" },
+    { "var": "title", "script": "en", "label": "英文歌名", "group": "歌名" },
+    { "var": "title", "script": "zh", "label": "中文歌名", "group": "歌名" },
+    { "var": "title", "script": "ja", "label": "日文歌名", "group": "歌名" },
+    { "var": "title", "script": "ko", "label": "韩文歌名", "group": "歌名" },
+
+    { "var": "artist", "label": "艺人", "group": "艺人" },
+    { "var": "artist", "script": "en", "label": "英文艺人", "group": "艺人" },
+    { "var": "artist", "script": "zh", "label": "中文艺人", "group": "艺人" },
+    { "var": "artist", "script": "ja", "label": "日文艺人", "group": "艺人" },
+    { "var": "artist", "script": "ko", "label": "韩文艺人", "group": "艺人" },
+
+    { "var": "album", "label": "专辑", "group": "其他" },
+    { "var": "year", "label": "年份", "group": "其他" },
+    { "var": "original", "label": "原文件名", "group": "其他" },
+    { "var": "literal", "label": "固定文字", "group": "其他" }
+  ],
+  "defaultSeparator": " - "
+}

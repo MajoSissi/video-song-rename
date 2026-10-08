@@ -1,0 +1,48 @@
+[package]
+name = "shazam-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "Audio fingerprinting + Shazam lookup sidecar for video-song-rename"
+license = "MIT"
+
+[[bin]]
+name = "shazam-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# 解码。`default-features = false` 去掉 `playback`，那一路会把 `cpal` 与
+# `alsa-sys` 拖进来；这个 crate 只解码，从不播放。纯 Rust，不需要 C 编译器。
+rodio = { version = "0.22.2", default-features = false, features = [
+    "flac",
+    "mp3",
+    "mp4",
+    "vorbis",
+    "wav",
+] }
+# `ffmpeg_wrapper` 用它中转 rodio 读不了的容器（.wma / .m4a / .aac）。
+tempfile = "3.27.0"
+# 指纹生成用的 FFT。纯 Rust。
+chfft = "0.3.4"
+byteorder = "1.5.0"
+crc32fast = "1.5.0"
+base64 = "0.23.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# rustls，不是 native-tls：OpenSSL 需要 C 工具链，本仓库的构建机没有。
+# `socks` 是为了 `socks5://` 代理——不加这个 feature 时 reqwest 只认 http/https
+# 代理，用户填了本地 SOCKS 端口会得到一个语焉不详的 URL 解析错误。
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "gzip",
+    "socks",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = "symbols"
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"

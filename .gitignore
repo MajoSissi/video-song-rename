@@ -1,0 +1,89 @@
+# ============================================================================
+# 视频歌曲重命名 —— 不进版本库的东西
+# ============================================================================
+#
+# 判断标准只有一条：**能从仓库里的源文件重新生成的东西，都不进仓库。**
+#
+# 反过来说，凡是不写在这里的，都是「手工维护的源」——`sidecar/src/`、
+# `frontend/index.html`、`assets/icon.ico`、`sidecar/Cargo.lock`、
+# `go.sum`、`sidecar/third_party/shazamio-core/LICENSE` 这些。
+# 它们看着像产物（尤其 `Cargo.lock` 和 `go.sum`），但必须提交：
+# 少了它们别人 clone 下来编出来的东西和这里不是同一份。
+#
+# 一个具体的坑：`sidecar/target/` 有 1.4 GB（debug 752 MB + release 580 MB）。
+# 不忽略的话，第一次 `git add .` 就要往仓库里塞一整个 Rust 构建目录，
+# 而且推不上去的那一刻才发现。
+#
+# 需要临时放开某一项时，用 `git add -f <路径>`，别去改这个文件 ——
+# 改了容易忘记改回来，而这条规则一旦松掉，下次就没人知道它原来为什么在。
+
+# ---------------------------------------------------------------- 构建产物
+
+# Rust 识别核心。`cargo build` 的整个输出目录，1.4 GB。
+# 用 `/` 开头锚在根目录：`sidecar/target` 是唯一那个，但锚上更保险 ——
+# 以后万一多了别的 `target/`，不至于被这条顺手忽略掉。
+/sidecar/target/
+
+# 界面 + sidecar 的组装结果。`./build.sh` 产出，17 MB。
+# 连 `dist/data/` 一起忽略：那里是**运行时的**配置、日志、改名记录
+# （程序跑起来就往旁边写），属于用户数据，更不该进仓库。
+/dist/
+
+# exe 的图标与版本资源（COFF 对象，382 KB）。
+#
+# 它由 `tools/genrsrc.go` 从 `assets/icon.ico` 生成，而生成器是**确定性**的
+# ——验证过：重新生成的结果与当初手工跑出来的那份逐字节相同。
+# 所以它没必要占着仓库位置，反而会变成一个静默失效点：
+# 换了 `assets/icon.ico` 却忘了重跑生成器，exe 里就还是旧图标，且不报错。
+#
+# `./build.sh` 每次都会重新生成它，GitHub Action 里也一样。
+# 注意：**绕过 build.sh 直接 `go build` 的话不会生成**，编出来的 exe
+# 在资源管理器里没有自定义图标（窗口图标和托盘图标不受影响，
+# 那两个走的是运行时读 `assets/icon.ico`）。
+/rsrc_windows_amd64.syso
+
+# ---------------------------------------------------------------- 截图与预览
+
+# `python tools/shoot_ui.py` 的截图落点（build/shots、build/crop、build/inspect）。
+# 全是跑一遍就能重出的东西，而且每次改版式都会整体重生成 ——
+# 提交进仓库只会得到一堆和当前代码对不上的旧图。
+/build/
+
+# 预览页的生成物：`tools/preview/build_preview.py` 把 `frontend/index.html`
+# 复制一份并注入桩数据。源是 `frontend/index.html` + `tools/preview/stub.js`，
+# 那两份在仓库里，这一份不用。
+/tools/preview/index.html
+
+# 早期手工截的图，已经被 `build/shots/` 取代（还留着 `start-menu.png`，
+# 而那个下拉菜单早从界面上撤掉了）。
+/tools/preview/shots/
+
+# ---------------------------------------------------------------- 协作工具
+
+# AI 协作的本地痕迹：memory/ 里的工作日志，加上 capture.ps1、ps-out.txt、
+# shot-*.png 这些临时文件。属于本地留档，正式文档以 README.md / DEVELOP.md 为准。
+/.workbuddy-ai/
+
+# ---------------------------------------------------------------- 杂项
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go 的测试二进制与覆盖率报告
+*.test
+coverage.out
+
+# 日志。`dist/data/*.log` 已经被 /dist/ 覆盖，这条是兜住其它位置的。
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*.orig
