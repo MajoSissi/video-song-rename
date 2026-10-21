@@ -161,6 +161,72 @@ STUB_HISTORY = [
      "nowPath": r"D:\Music\夜空中最亮的星.mp3", "restored": False, "exists": False},
 ]
 
+# 分页用的两份大样本。
+#
+# 只有 8 个条目 / 5 条记录的桩验不出分页 —— 页数永远是 1，
+# 「第 2 页画的其实是第 1 到 50 条」这类错误一个都照不出来。
+# 120 是挑的：每页 50 正好 3 页，最后一页只有 20 条（能验「尾页不满」），
+# 换 100 一页是 2 页，换 200 一页是 1 页 —— 三档各有各的形状。
+PAGER_SAMPLE = 120
+
+# 样本的时间基准。**故意取一个过去的日子**（2026-02-02 前后）：
+# 这样「今天」「本月」两档预设必定命中 0 条，而「0 条」正是它们唯一
+# 能证明自己的方式 —— 预设要是写成了「全都返回」，这里就照不出来。
+PAGER_BASE_TS = 1770000000000
+PAGER_HOUR = 60 * 60 * 1000
+
+
+def big_items() -> list:
+    """任务页的分页样本：120 条。
+
+    状态按四种轮着来，于是每个筛选档各 30 条 —— 筛选和分页叠在一起才验得动
+    （筛完还剩几页、页码有没有回到第 1 页，都是这两件事交叉出来的）。
+    """
+    statuses = ["renamed", "no_match", "failed", "pending"]
+    items = []
+    for i in range(PAGER_SAMPLE):
+        name = "clip_%04d.mp4" % (i + 1)
+        new = "Track %d - Artist %d.mp4" % (i + 1, i + 1)
+        items.append({
+            "index": i,
+            "path": "D:\\Media\\分页样本\\" + name,
+            "dir": "D:\\Media\\分页样本",
+            "name": name, "ext": ".mp4",
+            "size": 40 * 1024 * 1024 + i * 1024,
+            "status": statuses[i % len(statuses)],
+            "title": "Track %d" % (i + 1),
+            "artist": "Artist %d" % (i + 1),
+            "album": "", "genre": "", "released": "", "label": "",
+            "coverArt": "", "shazamUrl": "",
+            "newName": new, "newPath": "D:\\Media\\分页样本\\" + new,
+            "message": "", "attempts": 1,
+        })
+    return items
+
+
+def big_history() -> list:
+    """记录页的分页样本：120 条，最新的在前（和后端 History() 的顺序一致）。
+
+    时间戳按小时递减铺开，于是「某一天」这个范围只命中其中一段 ——
+    日期筛选的边界（含起、含止、右端半开）才验得出来。
+    """
+    entries = []
+    for i in range(PAGER_SAMPLE):
+        name = "rec_%04d.mp4" % (i + 1)
+        to = "Song %04d.mp4" % (i + 1)
+        entries.append({
+            "ts": PAGER_BASE_TS - i * PAGER_HOUR,
+            "from": "D:\\Media\\分页样本\\" + name,
+            "to": "D:\\Media\\分页样本\\" + to,
+            "nowPath": "D:\\Media\\分页样本\\" + to,
+            # 每 5 条一条已还原、每 7 条一条文件已不在，于是三种状态都有，
+            # 而且「全选只勾可还原的」和「移除所选对三种都生效」都能分辨出来。
+            "restored": i % 5 == 4,
+            "exists": i % 7 != 6,
+        })
+    return entries
+
+
 STUB_JS = """
 // ---- 截图专用的桩：真实的 window.go / window.runtime 只有 Wails 运行时才有 ----
 window.runtime = {
@@ -278,12 +344,23 @@ window.go = { main: { App: {
   Items: function () { return __ok(__items); },
   Progress: function () { return __ok({ total: 6, done: 5, matched: 2, unmatched: 1, failed: 1, skipped: 0, renamed: 1, running: true }); },
   History: function () { return __ok(__history); },
+  // 移除记录。桩里真的从这份数组里删掉那几条，好让「移除所选（2）」
+  // 和点完之后剩下的行数对得上。
+  RemoveHistory: function (targets) {
+    const drop = new Set(targets || []);
+    for (let i = __history.length - 1; i >= 0; i--) {
+      if (drop.has(__history[i].to)) __history.splice(i, 1);
+    }
+    return __ok(__history);
+  },
   PreviewCommand: function (p) { return __ok('shazam-sidecar.exe --file "' + p + '" --seconds 12 --language en-US --country GB --timeout 20'); },
-  AddPaths: function () { return __ok({ items: __items, added: 0, rejected: [] }); },
+  AddPaths: function () { return __ok({ items: __items, added: 0, rejected: [], expanded: [] }); },
   CloseWindow: function () {}, ShowWindow: function () {}, HideWindow: function () {}, QuitApp: function () {},
   Pause: function () {}, Resume: function () {}, Stop: function () {}, Start: function () {},
   Clear: function () {}, RemoveItems: function () { return __ok(__items); },
   ScanPath: function () { return __ok(__items); },
+  // 还原之后让队列跟上磁盘。**不新增也不删除**，所以这里照原样回一份。
+  ResyncQueue: function () { return __ok(__items); },
   PickFiles: function () { return __ok([]); }, PickFolder: function () { return __ok(''); },
   PickFFmpeg: function () { return __ok(''); },
   ExportCSV: function () { return __ok(''); }, Undo: function () { return __ok({ restored: 0, missing: 0, skipped: 0, details: [] }); },
@@ -544,11 +621,13 @@ TEMPLATE_PROBE_JS = """
 """
 
 
-# 记录页的勾选 / 批量还原 / 筛选 / 搜索。只在 #history+histprobe 时跑。
+# 记录页的勾选 / 批量还原 / 批量移除 / 筛选 / 搜索 / shift 连选。
+# 只在 #history+histprobe 时跑。
 #
 # 要守的是几件截图看不出来的事：
-#   * 勾选框只长在「真的能还原」的行上；
-#   * 改筛选或搜索会**清空勾选** —— 不清的话「看不见的行也被改」就成了默认行为；
+#   * 三种状态的记录**都能勾**（移除记录对它们一样有效），
+#     但只有「可还原」的能进「还原所选」；
+#   * 按钮上的数字必须等于真正会动的条数，而且随筛选 / 搜索收窄；
 #   * 全选框只作用于当前筛出来的那批；
 #   * 搜不到东西时说的是「没有符合条件的记录」，不是「还没有改名记录」。
 HISTORY_PROBE_JS = """
@@ -556,7 +635,8 @@ HISTORY_PROBE_JS = """
   if (!location.hash.split('+').includes('histprobe')) return;
 
   function run() {
-    // histpick 只为了截图：把可还原的都勾上，好看清按钮上的数字和表头那颗全选框的状态。
+    // histpick 只为了截图：把能勾的都勾上，好看清两颗按钮上的数字
+    // 和表头那颗全选框的状态。
     if (location.hash.split('+').includes('histpick')) {
       document.getElementById('histAll').click();
       return;
@@ -574,6 +654,9 @@ HISTORY_PROBE_JS = """
         emptyTitle: document.getElementById('histEmptyTitle').textContent,
         emptyCount: document.getElementById('histCount').textContent,
         emptyButtonDisabled: document.getElementById('btnUndoSelected').disabled,
+        emptyRemoveDisabled: document.getElementById('btnRemoveHistory').disabled,
+        emptyPagerHidden:
+          getComputedStyle(document.getElementById('histPagerBar')).display === 'none',
       }));
       return;
     }
@@ -582,22 +665,34 @@ HISTORY_PROBE_JS = """
     const rows = () => document.querySelectorAll('#histBody tr');
     const boxes = () => [...document.querySelectorAll('#histBody input[type=checkbox]')];
     const button = document.getElementById('btnUndoSelected');
+    const remove = document.getElementById('btnRemoveHistory');
     const all = document.getElementById('histAll');
     const filter = document.getElementById('histFilter');
     const search = document.getElementById('histSearch');
-    const pickable = () => boxes().filter((b) => !b.disabled);
+    // 可还原 = 那一行有「还原」按钮。以前这里看的是「勾选框禁没禁用」，
+    // 现在三种状态都能勾（移除记录对它们一样有效），只能看按钮。
+    const restorable = () =>
+      [...rows()].filter((tr) => tr.children[5].querySelector('button'));
+    const boxAt = (i) => rows()[i].querySelector('input[type=checkbox]');
     // 把勾选推到一个确定的状态：先全取消，再全选。
     // （indeterminate 时点一下会变成「已勾」，所以要循环。）
     const pickAll = () => {
       while (all.checked || all.indeterminate) all.click();
       all.click();
     };
+    const clearAll = () => {
+      while (all.checked || all.indeterminate) all.click();
+    };
 
     out.rows = rows().length;
     out.checkboxes = boxes().length;
-    out.pickable = pickable().length;
+    // 5 条全都可勾 —— 勾选是记录级的，不是「可还原」级的。
+    out.enabledBoxes = boxes().filter((b) => !b.disabled).length;
+    out.restorableRows = restorable().length;
     out.buttonAtStart = button.textContent;
     out.disabledAtStart = button.disabled;
+    out.removeAtStart = remove.textContent;
+    out.removeDisabledAtStart = remove.disabled;
     out.countAtStart = document.getElementById('histCount').textContent;
 
     // ---- 被手动改过名的文件 ----
@@ -617,46 +712,74 @@ HISTORY_PROBE_JS = """
       (tr) => tr.querySelector('.moved')
         && tr.textContent.indexOf('已还原') >= 0);
 
-    // 全选 → 只有可还原的那些被勾上，另外两种状态的行勾不了。
+    // 全选 → 5 条**全部**被勾上（勾选是记录级的），但「还原所选」只数
+    // 其中可还原的那 3 条 —— 两颗按钮认的不是同一批，数字也就该不一样。
     all.click();
     out.pickedByAll = boxes().filter((b) => b.checked).length;
     out.allChecked = all.checked;
     out.buttonAfterAll = button.textContent;
+    out.removeAfterAll = remove.textContent;
     all.click();
     out.pickedAfterClear = boxes().filter((b) => b.checked).length;
     out.buttonAfterClear = button.textContent;
     out.disabledAfterClear = button.disabled;
+    out.removeAfterClear = remove.textContent;
+    out.removeDisabledAfterClear = remove.disabled;
 
-    // 单独勾一条 → 按钮亮起，表头那颗全选框跟着变（只有部分可勾项时是 indeterminate）。
-    pickable()[0].click();
+    // 单独勾一条 → 按钮亮起，表头那颗全选框跟着变（只有部分勾选时是 indeterminate）。
+    restorable()[0].querySelector('input[type=checkbox]').click();
     out.buttonAfterOne = button.textContent;
     out.enabledAfterOne = !button.disabled;
     out.allIndeterminate = all.indeterminate;
 
+    // ---- shift 连选 ----
+    //
+    // 一屏几百条时一条条点不现实，而「全选」又太粗 —— 用户往往只要中间一段。
+    // 从第 1 行 shift 点到第 3 行，三行都要勾上；再用 shift 点回第 1 行
+    // （这时锚点已经落在第 3 行上）应当把这一段一起清掉。
+    //
+    // **不要手动设 box.checked**：浏览器在派发 click 之前会先把这一格的勾选
+    // 状态翻过去（pre-click activation，对 dispatchEvent 出来的 click 一样生效），
+    // 手动设的值正好被它翻掉 —— 于是「shift 点一下」变成了「shift 取消一下」，
+    // 三条一个都没勾上。想要哪一格变成什么状态，只能靠它现在是什么状态。
+    clearAll();
+    boxAt(0).click();          // 勾上第 1 行，锚点落在这一格
+    const shiftClick = (i) => {
+      boxAt(i).dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    };
+    shiftClick(2);             // shift 点第 3 行 → 第 1..3 行一起勾上
+    out.shiftPicked = boxes().filter((b) => b.checked).length;
+    out.shiftAnchorKept = all.indeterminate;
+    shiftClick(0);             // 锚点已在第 3 行 → 这一下取消的是整段
+    out.shiftCleared = boxes().filter((b) => b.checked).length;
+
     // ---- 勾选与筛选的联动 ----
     //
-    // 全页最危险的地方在这儿：勾了三行、筛掉两行，按钮却还写着 3 ——
-    // 按下去三行全被改，其中两行用户根本看不见。
+    // 全页最危险的地方在这儿：勾了五行、筛掉四行，按钮却还写着 5 ——
+    // 按下去五行全被动，其中四行用户根本看不见。
     filter.value = 'all';
     filter.dispatchEvent(new Event('change'));
-    pickAll();                                    // 勾上全部 3 条可还原的
+    pickAll();                                    // 勾上全部 5 条
     out.pickedBeforeFilter = boxes().filter((b) => b.checked).length;
     out.buttonBeforeFilter = button.textContent;
+    out.removeBeforeFilter = remove.textContent;
 
-    // 切到「可还原」：这三条还在屏幕上，勾选留着，不必让用户重新勾一遍。
+    // 切到「可还原」：那三条还在屏幕上，勾选留着，不必让用户重新勾一遍。
     filter.value = 'undoable';
     filter.dispatchEvent(new Event('change'));
     out.undoableRows = rows().length;
     out.pickedOnUndoable = boxes().filter((b) => b.checked).length;
 
-    // 切到「已还原」：刚才那三条全被筛掉了。屏幕上一条勾都没有，
-    // 按钮必须跟着熄掉 —— 绝不能还写着 3。
+    // 切到「已还原」：刚才那三条可还原的全被筛掉了。
+    // 屏幕上剩下的这一条是「已还原」的 —— 它能勾（移除记录用得上），
+    // 但绝不能进「还原所选」，那颗按钮必须熄掉。
     filter.value = 'restored';
     filter.dispatchEvent(new Event('change'));
     out.restoredRows = rows().length;
     out.pickedAfterFilter = boxes().filter((b) => b.checked).length;
     out.buttonAfterFilter = button.textContent;
     out.disabledAfterFilter = button.disabled;
+    out.removeAfterFilter = remove.textContent;
 
     filter.value = 'missing';
     filter.dispatchEvent(new Event('change'));
@@ -670,7 +793,7 @@ HISTORY_PROBE_JS = """
     // 只会让用户白勾一遍。
     out.pickedBackToAll = boxes().filter((b) => b.checked).length;
 
-    // 搜索同样收窄可见范围：勾上三条，再搜一个只命中别处的词。
+    // 搜索同样收窄可见范围：勾上五条，再搜一个只命中别处的词。
     pickAll();
     out.pickedBeforeSearch = boxes().filter((b) => b.checked).length;
     search.value = 'clip';
@@ -679,6 +802,7 @@ HISTORY_PROBE_JS = """
     out.searchCount = document.getElementById('histCount').textContent;
     out.pickedAfterSearch = boxes().filter((b) => b.checked).length;
     out.buttonAfterSearch = button.textContent;
+    out.removeAfterSearch = remove.textContent;
 
     // 搜不到：表格收起，空状态说的是「没有符合条件的记录」而不是「还没有记录」。
     search.value = 'zzz-查不到';
@@ -724,7 +848,50 @@ HISTORY_PROBE_JS = """
     out.sent = sent ? sent.length : 'null';
     out.sentNames = sent ? sent.map((p) => String(p).split(/[\\/]/).pop()).join(' | ') : '';
 
-    document.documentElement.setAttribute('data-hist-probe', JSON.stringify(out));
+    // ---- 移除所选送出去的是哪些 ----
+    //
+    // 和上面同一个道理：按钮上写着几，后端就必须收到几条。
+    // 而且移除**不筛 canRestore** —— 「已还原」「已不在」的记录一样要能被清掉，
+    // 它们往往才是最该清理的（已经没事可做了）。
+    //
+    // 这里把 RemoveHistory 也换成一个只记参数的桩，然后真的按一下。
+    // 它带确认弹窗，所以要先点「确定」—— 顺便把弹窗的文案也记下来。
+    filter.value = 'all';
+    filter.dispatchEvent(new Event('change'));
+    search.value = '';
+    search.dispatchEvent(new Event('input'));
+    pickAll();
+    out.pickedBeforeRemove = boxes().filter((b) => b.checked).length;
+
+    let dropped = null;
+    App.RemoveHistory = (targets) => {
+      dropped = targets;
+      return Promise.resolve([]);
+    };
+    remove.click();
+
+    // 确认弹窗是自绘的：先读文案，再点确定。
+    const mask = document.getElementById('modalMask');
+    out.removeAsked = !mask.classList.contains('hidden');
+    out.removeBody = document.getElementById('modalBody').textContent;
+    out.removeOkLabel = document.getElementById('modalOk').textContent;
+    out.removeIsDanger = document.getElementById('modalOk').className === 'danger';
+    document.getElementById('modalOk').click();
+
+    // 「后端收到了什么」要等到 removePicked 从确认弹窗的 await 里回来才读得到
+    // （它是个微任务），所以这里轮询等一下，最后才把探针结果落进 DOM。
+    // 直接同步读会永远是 null —— 而那样写出来的断言是假的：它永远「通过」。
+    let left = 200;
+    (function settle() {
+      if (dropped === null && left-- > 0) {
+        setTimeout(settle, 10);
+        return;
+      }
+      out.dropped = dropped ? dropped.length : 'null';
+      out.droppedNames = dropped
+        ? dropped.map((p) => String(p).split(/[\\/]/).pop()).join(' | ') : '';
+      document.documentElement.setAttribute('data-hist-probe', JSON.stringify(out));
+    })();
   }
 
   let tries = 0;
@@ -739,7 +906,164 @@ HISTORY_PROBE_JS = """
 """
 
 
+# 分页 / 时间范围。跑在两份 120 条的大样本页面上（tasksmany / histmany）。
+#
+# 为什么非要有大样本：只有 8 条 / 5 条时页数永远是 1，「第 2 页画的是
+# 第 51..100 条」「尾页只剩 20 条」「换每页条数要回到第 1 页」这些
+# 一条都照不出来。而分页这东西出错的方式恰恰全是这种 —— 它不报错，
+# 只是画错一截，用户翻到第 2 页看到重复的内容。
+PAGER_PROBE_JS = """
+(function () {
+  const flags = location.hash.split('+');
+  const wantTasks = flags.includes('taskpage');
+  const wantHistory = flags.includes('histpage');
+  if (!wantTasks && !wantHistory) return;
+
+  function run() {
+    const out = {};
+    const ids = wantTasks
+      ? { size: 'pageSize', info: 'pageInfo', prev: 'pagePrev', next: 'pageNext', body: 'tbody', name: 1 }
+      : { size: 'histPageSize', info: 'histPageInfo', prev: 'histPagePrev',
+          next: 'histPageNext', body: 'histBody', name: 2 };
+    const el = (id) => document.getElementById(id);
+    const body = el(ids.body);
+    const info = el(ids.info);
+    const prev = el(ids.prev);
+    const next = el(ids.next);
+    const sizeSel = el(ids.size);
+    const count = () => body.querySelectorAll('tr').length;
+    const first = () => (body.rows.length ? body.rows[0].cells[ids.name].textContent.trim() : '');
+    const click = (node) => node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+    out.sizeDefault = sizeSel.value;
+    out.sizeOptions = [...sizeSel.options].map((o) => o.value).join(',');
+
+    // 每页 50（默认）：120 条应当正好 3 页，尾页只有 20 条。
+    out.rowsP1 = count();
+    out.infoP1 = info.textContent;
+    out.prevDisabledP1 = prev.disabled;
+    out.nextDisabledP1 = next.disabled;
+    // 第一页的第一条必须是**第 1 条**、第二页是第 51 条 ——
+    // 光数行数的话，「每页都画前 50 条」这种错照样能过。
+    out.firstP1 = first();
+
+    click(next);
+    out.rowsP2 = count();
+    out.infoP2 = info.textContent;
+    out.firstP2 = first();
+
+    click(next);
+    out.rowsP3 = count();
+    out.infoP3 = info.textContent;
+    out.nextDisabledP3 = next.disabled;
+    out.firstP3 = first();
+
+    // 翻回上一页：内容要跟着回来，不是停在第 3 页。
+    click(prev);
+    out.rowsBack = count();
+    out.infoBack = info.textContent;
+
+    // 换每页条数要回到第 1 页。停在第 3 页的话用户会看到一张
+    // 从中间开始的表，而他刚刚才把每页调大。
+    sizeSel.value = '300';
+    sizeSel.dispatchEvent(new Event('change'));
+    out.rowsSize300 = count();
+    out.infoSize300 = info.textContent;
+
+    sizeSel.value = '100';
+    sizeSel.dispatchEvent(new Event('change'));
+    out.rowsSize100 = count();
+    out.infoSize100 = info.textContent;
+    out.firstSize100 = first();
+
+    if (wantHistory) {
+      // ---- 时间范围 ----
+      //
+      // 样本数据固定在 2026-02（见 big_history），所以「今天」「本月」
+      // 必须命中 0 条。这同时证明这两档不是「全都返回」。
+      const rangeSel = el('histRange');
+      const custom = el('histRangeCustom');
+      const from = el('histFrom');
+      const to = el('histTo');
+      const wrap = el('histWrap');
+      const pagerBar = el('histPagerBar');
+
+      sizeSel.value = '50';
+      sizeSel.dispatchEvent(new Event('change'));
+
+      out.customHiddenAtStart = custom.classList.contains('hidden');
+
+      rangeSel.value = 'today';
+      rangeSel.dispatchEvent(new Event('change'));
+      out.todayRows = count();
+      out.todayInfo = info.textContent;
+      out.todayWrapHidden = getComputedStyle(wrap).display === 'none';
+      out.todayTitle = el('histEmptyTitle').textContent;
+      out.todayPagerHidden = getComputedStyle(pagerBar).display === 'none';
+
+      // 切到「自定义」才把两个日期框露出来 —— 预设档和日期框同时在场，
+      // 谁说了算得靠猜。
+      rangeSel.value = 'custom';
+      rangeSel.dispatchEvent(new Event('change'));
+      out.customShown = !custom.classList.contains('hidden');
+
+      const iso = (ms) => {
+        const d = new Date(ms);
+        const p = (n) => String(n).padStart(2, '0');
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+      };
+      const base = __BASE_TS__;
+
+      // 只填「起」= 「从那以后」。样本里最新的那条就在这一天。
+      from.value = iso(base);
+      from.dispatchEvent(new Event('change'));
+      out.fromOnlyRows = count();
+      out.fromOnlyFirst = first();
+      out.fromOnlyInfo = info.textContent;
+
+      // 起止同一天：右端是半开区间（到次日 00:00），所以这一天之内的
+      // 全都算 —— 写成闭区间的话最后那一条会被漏掉。
+      to.value = iso(base);
+      to.dispatchEvent(new Event('change'));
+      out.sameDayRows = count();
+      out.sameDayLast = body.rows.length
+        ? body.rows[body.rows.length - 1].cells[ids.name].textContent.trim() : '';
+
+      // 整个范围挪到数据之后：一条都不该剩，而且要说「没有符合条件的记录」，
+      // 不是「还没有改名记录」。
+      from.value = iso(base + 86400000);
+      to.value = iso(base + 2 * 86400000);
+      from.dispatchEvent(new Event('change'));
+      out.pastRows = count();
+      out.pastTitle = el('histEmptyTitle').textContent;
+      out.pastWrapHidden = getComputedStyle(wrap).display === 'none';
+      out.pastPagerHidden = getComputedStyle(pagerBar).display === 'none';
+
+      // 切回「全部时间」：日期框收起来，行数回到全部。
+      rangeSel.value = 'all';
+      rangeSel.dispatchEvent(new Event('change'));
+      out.backRows = count();
+      out.customHiddenAgain = custom.classList.contains('hidden');
+    }
+
+    document.documentElement.setAttribute('data-pager-probe', JSON.stringify(out));
+  }
+
+  let tries = 0;
+  (function tick() {
+    if (document.documentElement.dataset.boot !== 'done' && tries++ < 400) {
+      setTimeout(tick, 10);
+      return;
+    }
+    run();
+  })();
+})();
+""".replace("__BASE_TS__", str(PAGER_BASE_TS))
+
+
 # 这里原来有个 SLOT_OPEN_JS，用来把某一格的补充设置「点开」再截图。
+# 字段现在常驻（一行一段竖着排），没有展开这个状态，拿 #templates 直接截就行。
+
 # 字段现在常驻（一行一段竖着排），没有展开这个状态，拿 #templates 直接截就行。
 
 
@@ -1034,6 +1358,54 @@ DRAG_PROBE_JS = """
 })();
 """
 
+
+SCROLLBAR_PROBE_JS = """
+// 滚动条必须是自己画的那一套，不是原生的。只在 #tasks+scrollprobe 时跑。
+//
+// 这条**只能靠 DOM 量**：截图脚本带 --hide-scrollbars（不带的后果不只是每张图右边
+// 多一根条 —— 条的有无取决于内容高度，而内容高度逐页不同，那几张图的 md5
+// 比对就废了），所以截图里永远看不到滚动条，也永远证明不了它长什么样。
+//
+// 原生那根在深色主题上是一块浅灰，和面板的 #161920 差着好几个明度 ——
+// 它不像界面的一部分，像界面里嵌了另一个程序。所以量的是「有没有换成自己画的」：
+// 条宽、滑块颜色、圆角、轨道透明，四条一起对上才算数。
+//
+// 同时守**反方向**：模板页的 #tplScroll 和预览框 .preview 是**故意**把滚动条
+// 藏掉的（那一页要一屏看得全，见那边的 CSS 注释）。全局那套一旦写得不够具体
+// （比如挂到 * 上），就会把它们一起变回 10px —— 那两条断言就是防这个的。
+(function () {
+  if (!location.hash.split('+').includes('scrollprobe')) return;
+
+  const probe = (node) => {
+    if (!node) return null;
+    return {
+      width: getComputedStyle(node, '::-webkit-scrollbar').width,
+      track: getComputedStyle(node, '::-webkit-scrollbar-track').backgroundColor,
+      thumb: getComputedStyle(node, '::-webkit-scrollbar-thumb').backgroundColor,
+      radius: getComputedStyle(node, '::-webkit-scrollbar-thumb').borderRadius,
+    };
+  };
+
+  let tries = 0;
+  (function tick() {
+    if (document.documentElement.dataset.boot !== 'done' && tries++ < 400) {
+      setTimeout(tick, 10);
+      return;
+    }
+
+    const out = { pane: probe(document.querySelector('.pane')) };
+
+    // 那两处要切到模板页再量。切视图是同步的（只切 .hidden），切完立刻能读。
+    const nav = [...document.querySelectorAll('.nav')]
+      .find((n) => n.dataset.view === 'templates');
+    if (nav) nav.onclick();
+
+    out.tplScroll = probe(document.getElementById('tplScroll'));
+    out.preview = probe(document.querySelector('#view-templates .preview'));
+    document.documentElement.setAttribute('data-scrollbar-probe', JSON.stringify(out));
+  })();
+})();
+"""
 
 EMPTY_PROBE_JS = """
 // 空队列的互斥断言。只在 #tasks+emptyprobe 时跑，而且要跑在「空 items」那一版页面上。
@@ -1364,7 +1736,9 @@ def build_preview(dest: pathlib.Path, items: list | None = None,
         "<script>" + MENU_SHOT_JS + "</script>\n"
         "<script>" + SLOTFOCUS_SHOT_JS + "</script>\n"
         "<script>" + DRAG_PROBE_JS + "</script>\n"
+        "<script>" + SCROLLBAR_PROBE_JS + "</script>\n"
         "<script>" + HISTORY_PROBE_JS + "</script>\n"
+        "<script>" + PAGER_PROBE_JS + "</script>\n"
         "<script>" + EMPTY_PROBE_JS + "</script>\n"
         "<script>" + NUMBER_PROBE_JS + "</script>\n"
         "<script>" + SELECT_PROBE_JS + "</script>\n"
@@ -1808,6 +2182,70 @@ def check_drag(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]
     return True, ""
 
 
+def check_scrollbars(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
+    """滚动条要契合主题，不能是原生那根。
+
+    用户报的：「整个界面的滚动条都是原生的样式，要契合主题的风格样式去修改」。
+    原生那根在深色主题上是一块浅灰，和面板的 #161920 差着好几个明度。
+
+    截图证不了这件事 —— 截图脚本带 --hide-scrollbars，图里永远没有滚动条。
+    所以读的是 ::-webkit-scrollbar 那几个伪元素的计算值。Chromium 支持给
+    getComputedStyle 传伪元素名，读到的就是 CSS 里写的值（实测过）。
+
+    另外守反方向：模板页的 #tplScroll 和 .preview 是故意藏掉滚动条的，
+    全局那套一旦写得不够具体就会把它们一起变回来。
+    """
+    result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
+    dom = result.stdout or ""
+
+    match = re.search(r'data-scrollbar-probe="([^"]*)"', dom)
+    if not match:
+        return False, "滚动条探针没跑完（脚本报错？页面没加载？）"
+
+    raw = match.group(1).replace("&quot;", '"')
+    try:
+        probe = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return False, f"探针输出不是 JSON：{error} —— {raw[:120]}"
+
+    pane = probe.get("pane")
+    if not pane:
+        return False, "没量到底栏那个滚动容器（.pane）—— 选择器变了？"
+
+    checks = [
+        (
+            pane.get("width") == "10px",
+            "滚动条宽度是 %r，不是 10px —— 这条 CSS 没生效，界面上还是原生那根" % pane.get("width"),
+        ),
+        (
+            pane.get("thumb") == "rgb(35, 40, 51)",
+            "滑块颜色是 %r，不是主题里的 #232833" % pane.get("thumb"),
+        ),
+        (
+            pane.get("track") == "rgba(0, 0, 0, 0)",
+            "轨道不是透明的（%r）—— 会在面板上画出一条比面板更亮的底" % pane.get("track"),
+        ),
+        (
+            pane.get("radius") == "6px",
+            "滑块圆角是 %r，不是 6px" % pane.get("radius"),
+        ),
+    ]
+    for ok, reason in checks:
+        if not ok:
+            return False, reason
+
+    for name, label in (("tplScroll", "模板页的滚动区"), ("preview", "模板页的预览框")):
+        item = probe.get(name)
+        if not item:
+            return False, f"没量到{label}（{name}）—— 选择器变了？"
+        if item.get("width") != "0px":
+            return False, (
+                f"{label}（{name}）又出滚动条了（宽 {item.get('width')}）—— "
+                "那一页要一屏看得全，全局那套滚动条样式别把它一起盖住"
+            )
+    return True, ""
+
+
 def check_tpl_menu(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
     """模板列表右键菜单的重命名 / 复制 / 删除。
 
@@ -1918,11 +2356,16 @@ def check_tpl_menu(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, 
 
 
 def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
-    """记录页的勾选 / 批量还原 / 筛选 / 搜索。
+    """记录页的勾选 / 批量还原 / 批量移除 / 筛选 / 搜索 / shift 连选。
 
-    这一页最危险的地方是「勾选和屏幕上看到的不一致」：
-    勾了三行、筛掉两行、按下去却改了三行 —— 用户根本不知道被改了什么。
-    所以这里最重的一条是「切筛选会清空勾选」。
+    这一页最危险的地方是「按钮上的数字和真正会动的条数对不上」：
+    勾了五行、筛掉四行、按下去却动了五行 —— 用户根本不知道被改了什么。
+    所以最重的两条是「切筛选之后计数跟着收窄」和
+    「按下去时后端收到的条数 = 按钮上那个数字」。
+
+    另一件是「谁能勾」：勾选是记录级的，三种状态都要能勾（移除记录对它们
+    一样有效）；但只有「可还原」的能进「还原所选」。两件事混起来的话，
+    「清理记录」这个用法根本做不了。
     """
     result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
     dom = result.stdout or ""
@@ -1944,15 +2387,20 @@ def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, s
             "桩里 5 条记录应当有 5 行 5 个勾选框，实际 %s 行 %s 个"
             % (probe.get("rows"), probe.get("checkboxes")),
         ),
-        # 只有「现名还在、且没还原过」的行才给勾。另外两种勾了也只会得到一句「跳过」。
+        # 三种状态都能勾 —— 勾选是记录级的，而「移除所选」对它们一样有效。
+        # 只有「可还原」的那 3 条才有「还原」按钮。
         (
-            probe.get("pickable") == 3,
-            "应当只有 3 行能勾（可还原），实际 %s 行" % probe.get("pickable"),
+            probe.get("enabledBoxes") == 5 and probe.get("restorableRows") == 3,
+            "5 条记录应当都能勾、其中 3 条有「还原」按钮，实际能勾 %s 条、有按钮 %s 条"
+            % (probe.get("enabledBoxes"), probe.get("restorableRows")),
         ),
         (
-            probe.get("disabledAtStart") is True and probe.get("buttonAtStart") == "还原所选",
-            "一个都没勾时「还原所选」应当是禁用的，实际 %r（disabled=%s）"
-            % (probe.get("buttonAtStart"), probe.get("disabledAtStart")),
+            probe.get("disabledAtStart") is True and probe.get("buttonAtStart") == "还原所选"
+            and probe.get("removeDisabledAtStart") is True
+            and probe.get("removeAtStart") == "移除所选",
+            "一个都没勾时两颗按钮都该是禁用的，实际还原 %r（disabled=%s）/ 移除 %r（disabled=%s）"
+            % (probe.get("buttonAtStart"), probe.get("disabledAtStart"),
+               probe.get("removeAtStart"), probe.get("removeDisabledAtStart")),
         ),
         (
             probe.get("countAtStart") == "5 条",
@@ -1978,20 +2426,25 @@ def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, s
             "「已还原」那一行被挂上了「已改名」小标 —— 还原本来就会把文件改回原名，"
             "那是还原的结果，不是外部改名",
         ),
-        # 全选：只作用于可还原的那些，按钮上要写出会动几个。
+        # 全选：5 条全部勾上（勾选是记录级的），而两颗按钮各自数自己认的那批。
         (
-            probe.get("pickedByAll") == 3 and probe.get("allChecked") is True,
-            "全选应当勾上 3 条可还原的、并且表头也变勾上，实际勾了 %s（表头 %s）"
+            probe.get("pickedByAll") == 5 and probe.get("allChecked") is True,
+            "全选应当勾上全部 5 条、并且表头也变勾上，实际勾了 %s（表头 %s）"
             % (probe.get("pickedByAll"), probe.get("allChecked")),
         ),
         (
-            probe.get("buttonAfterAll") == "还原所选（3）",
-            "全选之后按钮应当写「还原所选（3）」，实际 %r" % probe.get("buttonAfterAll"),
+            probe.get("buttonAfterAll") == "还原所选（3）"
+            and probe.get("removeAfterAll") == "移除所选（5）",
+            "全选之后应当写「还原所选（3）」和「移除所选（5）」（3 条可还原、5 条可移除），"
+            "实际 %r / %r" % (probe.get("buttonAfterAll"), probe.get("removeAfterAll")),
         ),
         (
-            probe.get("pickedAfterClear") == 0 and probe.get("disabledAfterClear") is True,
-            "取消全选之后应当一个都不剩、按钮回到禁用，实际勾了 %s（disabled=%s）"
-            % (probe.get("pickedAfterClear"), probe.get("disabledAfterClear")),
+            probe.get("pickedAfterClear") == 0 and probe.get("disabledAfterClear") is True
+            and probe.get("removeDisabledAfterClear") is True,
+            "取消全选之后应当一个都不剩、两颗按钮都回到禁用，"
+            "实际勾了 %s（还原 disabled=%s / 移除 disabled=%s）"
+            % (probe.get("pickedAfterClear"), probe.get("disabledAfterClear"),
+               probe.get("removeDisabledAfterClear")),
         ),
         # 勾一部分时表头必须是 indeterminate —— 空框会让用户以为勾选丢了。
         (
@@ -2001,21 +2454,44 @@ def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, s
             "只勾一条时按钮应当写「还原所选（1）」且表头呈「部分勾选」，"
             "实际 %r / %s" % (probe.get("buttonAfterOne"), probe.get("allIndeterminate")),
         ),
-        # 最重的一条：切筛选之后，勾选集合必须跟着收窄到「当前看得见、可还原」的行。
+        # ---- shift 连选 ----
+        #
+        # 一屏几百条时一条条点不现实，而「全选」又太粗。
+        # 从第 1 行 shift 点到第 3 行 = 三行都勾上；再 shift 点回第 1 行
+        # （这次是取消）应当把这一段一起清掉。
         (
-            probe.get("pickedBeforeFilter") == 3
-            and probe.get("buttonBeforeFilter") == "还原所选（3）",
-            "勾上全部可还原项之后按钮应当写「还原所选（3）」，实际 %r（勾了 %s）"
-            % (probe.get("buttonBeforeFilter"), probe.get("pickedBeforeFilter")),
+            probe.get("shiftPicked") == 3 and probe.get("shiftAnchorKept") is True,
+            "从第 1 行 shift 点到第 3 行应当勾上 3 行、表头呈部分勾选，实际 %s 行"
+            % probe.get("shiftPicked"),
         ),
-        # 切到「已还原」：刚才那三条全被筛掉了，按钮绝不能再写着 3。
-        # 这就是「看不见的行也被一起还原」那个 bug 的样子。
         (
-            probe.get("pickedAfterFilter") == 0 and probe.get("disabledAfterFilter") is True
-            and probe.get("buttonAfterFilter") == "还原所选",
-            "勾了 3 条之后切到「已还原」档（那三条全被筛掉），按钮却还写着 %r"
-            "（勾了 %s 条）—— 这一按下去就会改掉用户看不见的文件"
-            % (probe.get("buttonAfterFilter"), probe.get("pickedAfterFilter")),
+            probe.get("shiftCleared") == 0,
+            "再 shift 点回第 1 行（取消）应当把这一段一起清掉，实际还剩 %s 行"
+            % probe.get("shiftCleared"),
+        ),
+        # 最重的一条：切筛选之后，计数必须跟着收窄到「当前看得见」的那批。
+        (
+            probe.get("pickedBeforeFilter") == 5
+            and probe.get("buttonBeforeFilter") == "还原所选（3）"
+            and probe.get("removeBeforeFilter") == "移除所选（5）",
+            "勾上全部 5 条之后应当写「还原所选（3）」「移除所选（5）」，"
+            "实际 %r / %r（勾了 %s）"
+            % (probe.get("buttonBeforeFilter"), probe.get("removeBeforeFilter"),
+               probe.get("pickedBeforeFilter")),
+        ),
+        # 切到「已还原」：刚才那三条可还原的全被筛掉了，剩下一行是「已还原」的。
+        # 它能勾（移除记录用得上），但绝不能进「还原所选」——
+        # 那颗按钮上写着 3 的话，这一按下去就会改掉用户看不见的文件。
+        (
+            probe.get("pickedAfterFilter") == 1
+            and probe.get("disabledAfterFilter") is True
+            and probe.get("buttonAfterFilter") == "还原所选"
+            and probe.get("removeAfterFilter") == "移除所选（1）",
+            "勾了 5 条之后切到「已还原」档（可还原的三条全被筛掉），"
+            "「还原所选」必须熄掉、「移除所选」只数剩下的那 1 条，"
+            "实际还原 %r（disabled=%s）/ 移除 %r"
+            % (probe.get("buttonAfterFilter"), probe.get("disabledAfterFilter"),
+               probe.get("removeAfterFilter")),
         ),
         # 反过来：切到「可还原」时那三条还在屏幕上，勾选该留着。
         (
@@ -2030,22 +2506,24 @@ def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, s
             % (probe.get("restoredRows"), probe.get("missingRows"),
                probe.get("backToAllRows")),
         ),
-        # 搜索把三条全藏起来（只剩一条不可还原的行）时，按钮必须熄掉。
+        # 搜索把五条收窄到一条（而且是不可还原的那条）时，按钮必须跟着收窄。
         (
-            probe.get("pickedBeforeSearch") == 3 and probe.get("searchRows") == 1
-            and probe.get("pickedAfterSearch") == 0
-            and probe.get("buttonAfterSearch") == "还原所选",
-            "勾了 3 条之后搜「clip」（只剩 1 条不可还原的行），按钮却还写着 %r"
-            % probe.get("buttonAfterSearch"),
+            probe.get("pickedBeforeSearch") == 5 and probe.get("searchRows") == 1
+            and probe.get("pickedAfterSearch") == 1
+            and probe.get("buttonAfterSearch") == "还原所选"
+            and probe.get("removeAfterSearch") == "移除所选（1）",
+            "勾了 5 条之后搜「clip」（只剩 1 条不可还原的行），"
+            "应当变成「还原所选」禁用 +「移除所选（1）」，实际 %r / %r"
+            % (probe.get("buttonAfterSearch"), probe.get("removeAfterSearch")),
         ),
         (
             probe.get("searchCount") == "显示 1 / 5 条",
             "搜「clip」时计数应当写「显示 1 / 5 条」，实际 %r" % probe.get("searchCount"),
         ),
         (
-            probe.get("pickedBackToAll") == 3,
-            "切回「全部」时原来勾的三条应当还勾着（实际 %s 条）—— "
-            "筛掉它们对安全没有帮助，只会让用户白勾一遍" % probe.get("pickedBackToAll"),
+            probe.get("pickedBackToAll") == 5,
+            "切回「全部」时原来勾的五条应当还勾着（实际 %s 条）—— "
+            "筛掉它们对安全没有帮助，只会让用户白勾一遍" % (probe.get("pickedBackToAll")),
         ),
         # 搜不到 ≠ 没有记录。这两句话混了，用户会以为记录被清空了。
         (
@@ -2069,6 +2547,32 @@ def check_history(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, s
             "但后端收到 %s 条（%s）—— 那几条用户根本看不见的文件也会被改掉"
             % (probe.get("pickedBeforeSend"), probe.get("buttonBeforeSend"),
                probe.get("sent"), probe.get("sentNames")),
+        ),
+        # ---- 移除所选 ----
+        #
+        # 它带确认弹窗（丢的是「这个文件原来叫什么」，不可再生），
+        # 而且文案里要写明磁盘上的文件不受影响 —— 用户最怕的就是
+        # 「移除」把文件也删了。
+        (
+            probe.get("removeAsked") is True
+            and probe.get("removeOkLabel") == "移除"
+            and "磁盘上的文件不会被删除" in (probe.get("removeBody") or ""),
+            "「移除所选」应当弹确认、按钮写「移除」、并说明磁盘上的文件不会被删除，"
+            "实际 弹出=%s / 按钮=%r / 正文=%r"
+            % (probe.get("removeAsked"), probe.get("removeOkLabel"), probe.get("removeBody")),
+        ),
+        # 这一批里有能还原的，所以是危险色。
+        (
+            probe.get("removeIsDanger") is True,
+            "这一批里有还能还原的记录，确认按钮该走危险色 —— "
+            "拿掉之后那些文件就再也改不回原名了",
+        ),
+        # 和还原同一条规矩：按钮上写着几，后端就得收到几条。
+        (
+            probe.get("pickedBeforeRemove") == 5 and probe.get("dropped") == 5,
+            "勾了 %s 条之后点「移除所选」，后端应当收到 5 条，实际 %s 条（%s）"
+            % (probe.get("pickedBeforeRemove"), probe.get("dropped"),
+               probe.get("droppedNames")),
         ),
     ]
 
@@ -2111,6 +2615,202 @@ def check_history_empty(chrome: str, profile: pathlib.Path, url: str) -> tuple[b
         return False, "空记录时计数应当是「0 条」，实际 %r" % probe.get("emptyCount")
     if probe.get("emptyButtonDisabled") is not True:
         return False, "一条记录都没有时「还原所选」应当是禁用的"
+    if probe.get("emptyRemoveDisabled") is not True:
+        return False, "一条记录都没有时「移除所选」应当是禁用的"
+    # 分页条也要一起收起来：记录一条都没有的时候还挂一句「第 1 / 1 页」，
+    # 用户会以为列表被筛空了。
+    if probe.get("emptyPagerHidden") is not True:
+        return False, "一条记录都没有时分页条还显示着（应当和表格一起收起来）"
+    return True, ""
+
+
+def read_probe(dom: str, attr: str):
+    """从 dump-dom 里取一个探针属性的 JSON。取不到时返回 (None, 原因)。
+
+    三条分页检查共用这一份 —— 它们只是属性名和断言不同，
+    解析这段（取属性、反转义、解析 JSON、报错措辞）不该抄三遍。
+    """
+    match = re.search(attr + r'="([^"]*)"', dom)
+    if not match:
+        return None, "探针没跑完（脚本报错？boot 没结束？）"
+    raw = match.group(1).replace("&quot;", '"')
+    try:
+        return json.loads(raw), ""
+    except json.JSONDecodeError as error:
+        return None, f"探针输出不是 JSON：{error} —— {raw[:120]}"
+
+
+def check_task_page(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
+    """任务列表的分页。跑在 120 条的样本页上（tasksmany.html）。
+
+    只有 8 条的桩验不出分页 —— 页数永远是 1。而分页出错是**不报错**的，
+    它只是画错一截：所以这里除了数行数，还把「这一页的第一条是哪一条」
+    一起钉住。「每页都画前 50 条」这种错，光数行数照样能过。
+    """
+    result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
+    probe, reason = read_probe(result.stdout or "", "data-pager-probe")
+    if probe is None:
+        return False, reason
+
+    checks = [
+        (
+            probe.get("sizeDefault") == "50"
+            and probe.get("sizeOptions") == "50,100,200,300",
+            "每页条数应当默认 50、可选 50/100/200/300，实际默认 %r（可选 %r）"
+            % (probe.get("sizeDefault"), probe.get("sizeOptions")),
+        ),
+        (
+            probe.get("rowsP1") == 50 and probe.get("infoP1") == "第 1 / 3 页"
+            and probe.get("prevDisabledP1") is True
+            and probe.get("nextDisabledP1") is False
+            and probe.get("firstP1") == "clip_0001.mp4",
+            "120 条每页 50：第一页该是 50 行 / 第 1 / 3 页 / 从第 1 条开始，"
+            "实际 %s 行 / %r / 首行 %r（上页禁用=%s 下页禁用=%s）"
+            % (probe.get("rowsP1"), probe.get("infoP1"), probe.get("firstP1"),
+               probe.get("prevDisabledP1"), probe.get("nextDisabledP1")),
+        ),
+        (
+            probe.get("rowsP2") == 50 and probe.get("infoP2") == "第 2 / 3 页"
+            and probe.get("firstP2") == "clip_0051.mp4",
+            "第二页该从第 51 条开始、50 行，实际 %s 行 / %r / 首行 %r —— "
+            "每页都画前 50 条的话这里就露馅了"
+            % (probe.get("rowsP2"), probe.get("infoP2"), probe.get("firstP2")),
+        ),
+        (
+            probe.get("rowsP3") == 20 and probe.get("infoP3") == "第 3 / 3 页"
+            and probe.get("nextDisabledP3") is True
+            and probe.get("firstP3") == "clip_0101.mp4",
+            "尾页该只剩 20 行（120 - 100）且「下一页」置灰，实际 %s 行 / %r / 首行 %r"
+            % (probe.get("rowsP3"), probe.get("infoP3"), probe.get("firstP3")),
+        ),
+        (
+            probe.get("rowsBack") == 50 and probe.get("infoBack") == "第 2 / 3 页",
+            "翻回上一页该回到第 2 页、50 行，实际 %s 行 / %r"
+            % (probe.get("rowsBack"), probe.get("infoBack")),
+        ),
+        (
+            probe.get("rowsSize300") == 120 and probe.get("infoSize300") == "第 1 / 1 页",
+            "每页 300 时 120 条该一页装完，实际 %s 行 / %r"
+            % (probe.get("rowsSize300"), probe.get("infoSize300")),
+        ),
+        (
+            probe.get("rowsSize100") == 100 and probe.get("infoSize100") == "第 1 / 2 页"
+            and probe.get("firstSize100") == "clip_0001.mp4",
+            "每页 100 时该是 100 行 / 第 1 / 2 页 / **从第 1 条开始**"
+            "（换每页条数要回到第 1 页），实际 %s 行 / %r / 首行 %r"
+            % (probe.get("rowsSize100"), probe.get("infoSize100"),
+               probe.get("firstSize100")),
+        ),
+    ]
+
+    for ok, message in checks:
+        if not ok:
+            return False, message
+    return True, ""
+
+
+def check_history_page(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
+    """记录列表的分页 + 时间范围筛选。跑在 120 条的样本页上（histmany.html）。
+
+    时间范围那一半靠样本的**固定**时间戳（见 big_history）：它是 2026-02 的，
+    所以「今天」「本月」必须命中 0 条 —— 预设要是写成了「全都返回」，这里就照出来。
+    自定义那半用从样本算出来的日期，于是不依赖跑在哪个时区。
+    """
+    result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
+    probe, reason = read_probe(result.stdout or "", "data-pager-probe")
+    if probe is None:
+        return False, reason
+
+    checks = [
+        (
+            probe.get("sizeDefault") == "50"
+            and probe.get("sizeOptions") == "50,100,200,300",
+            "每页条数应当默认 50、可选 50/100/200/300，实际默认 %r（可选 %r）"
+            % (probe.get("sizeDefault"), probe.get("sizeOptions")),
+        ),
+        (
+            probe.get("rowsP1") == 50 and probe.get("infoP1") == "第 1 / 3 页"
+            and probe.get("firstP1") == "rec_0001.mp4",
+            "120 条每页 50：第一页该是 50 行 / 第 1 / 3 页 / 从最新那条开始，"
+            "实际 %s 行 / %r / 首行 %r"
+            % (probe.get("rowsP1"), probe.get("infoP1"), probe.get("firstP1")),
+        ),
+        (
+            probe.get("rowsP2") == 50 and probe.get("firstP2") == "rec_0051.mp4",
+            "第二页该从第 51 条开始，实际 %s 行 / 首行 %r"
+            % (probe.get("rowsP2"), probe.get("firstP2")),
+        ),
+        (
+            probe.get("rowsP3") == 20 and probe.get("infoP3") == "第 3 / 3 页"
+            and probe.get("nextDisabledP3") is True
+            and probe.get("firstP3") == "rec_0101.mp4",
+            "尾页该只剩 20 行且「下一页」置灰，实际 %s 行 / %r / 首行 %r"
+            % (probe.get("rowsP3"), probe.get("infoP3"), probe.get("firstP3")),
+        ),
+        (
+            probe.get("rowsSize300") == 120 and probe.get("infoSize300") == "第 1 / 1 页",
+            "每页 300 时 120 条该一页装完，实际 %s 行 / %r"
+            % (probe.get("rowsSize300"), probe.get("infoSize300")),
+        ),
+        # ---- 时间范围 ----
+        (
+            probe.get("customHiddenAtStart") is True,
+            "没选「自定义…」时两个日期框不该露出来 —— 预设档和日期框同时在场，"
+            "谁说了算得靠猜",
+        ),
+        # 样本是 2026-02 的，所以「今天」必须 0 条。这同时证明这一档不是「全都返回」。
+        (
+            probe.get("todayRows") == 0 and probe.get("todayInfo") == "—"
+            and probe.get("todayWrapHidden") is True
+            and probe.get("todayTitle") == "没有符合条件的记录"
+            and probe.get("todayPagerHidden") is True,
+            "样本是 2026-02 的记录，切到「今天」该一条都不剩、表格和分页条一起收起、"
+            "并说「没有符合条件的记录」，实际 %s 行 / %r / 表格隐藏=%s / %r / 分页隐藏=%s"
+            % (probe.get("todayRows"), probe.get("todayInfo"),
+               probe.get("todayWrapHidden"), probe.get("todayTitle"),
+               probe.get("todayPagerHidden")),
+        ),
+        (
+            probe.get("customShown") is True,
+            "选到「自定义…」之后两个日期框该露出来",
+        ),
+        # 只填「起」= 「从那以后」。样本最新的一条就在这一天，所以它必须还在。
+        (
+            isinstance(probe.get("fromOnlyRows"), int)
+            and 0 < probe.get("fromOnlyRows") < 120
+            and probe.get("fromOnlyFirst") == "rec_0001.mp4",
+            "只填起始日期时该收窄到这一天及以后（最新那条必须还在），"
+            "实际 %s 行 / 首行 %r" % (probe.get("fromOnlyRows"), probe.get("fromOnlyFirst")),
+        ),
+        # 起止同一天：右端是半开区间（到次日 00:00），所以这一天之内的全都算。
+        # 把 to 当成「那一天 00:00」的写法会得到 0 行 —— 而用户选「今天」时
+        # 最想看到的恰恰是今天。
+        (
+            probe.get("sameDayRows") == probe.get("fromOnlyRows")
+            and probe.get("sameDayRows") > 0,
+            "起止填同一天时该命中这一天内的全部记录（实际 %s 行，只填起始时 %s 行）—— "
+            "右端写成「那一天 00:00」的话这里会是 0"
+            % (probe.get("sameDayRows"), probe.get("fromOnlyRows")),
+        ),
+        (
+            probe.get("pastRows") == 0 and probe.get("pastWrapHidden") is True
+            and probe.get("pastPagerHidden") is True
+            and probe.get("pastTitle") == "没有符合条件的记录",
+            "范围挪到样本之后该一条都不剩、表格和分页条一起收起，"
+            "实际 %s 行 / 表格隐藏=%s / 分页隐藏=%s / %r"
+            % (probe.get("pastRows"), probe.get("pastWrapHidden"),
+               probe.get("pastPagerHidden"), probe.get("pastTitle")),
+        ),
+        (
+            probe.get("backRows") == 50 and probe.get("customHiddenAgain") is True,
+            "切回「全部时间」该收起日期框、回到第一页 50 行，实际 %s 行 / 日期框还露着=%s"
+            % (probe.get("backRows"), not probe.get("customHiddenAgain")),
+        ),
+    ]
+
+    for ok, message in checks:
+        if not ok:
+            return False, message
     return True, ""
 
 
@@ -2388,6 +3088,10 @@ def main() -> int:
     # 记录页的空状态同理，而且是**两种**说法：一条记录都没有 / 筛完没剩下。
     # 不搭一份空记录的页面，第一种永远只是纸上的分支。
     build_preview(site / "histempty.html", history=[])
+    # 分页得用大样本才验得动：8 条 / 5 条时页数永远是 1，
+    # 「第 2 页画的是第 51..100 条」「尾页只剩 20 条」一条都照不出来。
+    build_preview(site / "tasksmany.html", items=big_items())
+    build_preview(site / "histmany.html", history=big_history())
     # 标题栏那个图标。真实运行时它和 index.html 一起被 //go:embed 编进 exe，
     # 静态服务这边要单独拷一份，否则截图里会是一个碎图。
     icon = INDEX.parent / "icon.png"
@@ -2573,6 +3277,15 @@ def main() -> int:
     else:
         print("  ✅ 拖放遮罩    拖文本/拖槽位不亮，拖文件才亮，离开和松手都收得掉")
 
+    # 滚动条。截图带 --hide-scrollbars，看不见它，只能读伪元素的计算值。
+    ok, reason = check_scrollbars(chrome, profile, f"{base}#tasks+scrollprobe")
+    if not ok:
+        failures.append("滚动条")
+        print(f"  ❌ 滚动条      {reason}")
+    else:
+        print("  ✅ 滚动条      自己画的（10px / #232833 / 圆角 / 透明轨道），"
+              "模板页那两处照旧藏着")
+
     # 记录页的勾选 / 批量还原 / 筛选 / 搜索。跑一次 Chrome，不改动截图。
     ok, reason = check_history(chrome, profile, f"{base}#history+histprobe")
     if not ok:
@@ -2589,6 +3302,30 @@ def main() -> int:
         print(f"  ❌ 记录空态    {reason}")
     else:
         print("  ✅ 记录空态    没有记录时说「还没有改名记录」，不是「没有符合条件的记录」")
+
+    # 分页。8 条 / 5 条的桩页页数永远是 1，验不动 —— 换成 120 条的样本页。
+    #
+    # 分页出错的方式很特别：它**不报错**，只是画错一截。翻到第 2 页看到的是
+    # 第 1..50 条，界面照样一片正常。所以除了数行数，还得钉住「这一页的
+    # 第一条到底是哪一条」—— 光数行数，「每页都画前 50 条」这种错照样能过。
+    many_tasks = base.replace("/index.html", "/tasksmany.html")
+    ok, reason = check_task_page(chrome, profile, f"{many_tasks}#tasks+taskpage")
+    if not ok:
+        failures.append("任务分页")
+        print(f"  ❌ 任务分页    {reason}")
+    else:
+        print("  ✅ 任务分页    默认 50 / 可选 50·100·200·300 / 120 条切成 50·50·20 / 换档回第 1 页")
+
+    # 记录页的分页 + 时间范围。同一份 120 条的样本也拿来验日期筛选：
+    # 样本的时间固定在 2026-02，所以「今天」「本月」必须命中 0 条 ——
+    # 预设要是写成了「全都返回」，只有这种「故意取过去的日子」的样本照得出来。
+    many_hist = base.replace("/index.html", "/histmany.html")
+    ok, reason = check_history_page(chrome, profile, f"{many_hist}#history+histpage")
+    if not ok:
+        failures.append("记录分页")
+        print(f"  ❌ 记录分页    {reason}")
+    else:
+        print("  ✅ 记录分页    分页同任务页 / 日期框按需露出 / 起止同一天不漏 / 范围外说「没有符合条件」")
 
     # 勾选态单独截一张：表头全选框和「还原所选（3）」平时是看不见的，
     # 不勾上就截不到，那张图也就证明不了它们长什么样。

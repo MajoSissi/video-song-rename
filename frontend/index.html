@@ -35,6 +35,57 @@
 
   * { box-sizing: border-box; }
 
+  /* 滚动条。整个界面里的滚动条都归这里管，没有例外。
+     原生那根在深色主题上是一块浅灰，和面板的 #161920 差着好几个明度 ——
+     它不像「界面的一部分」，像「界面里嵌了另一个程序」。
+
+     重画的思路：轨道**全透明**，让面板底色自己当背景；只有滑块有颜色，
+     起手用 --panel-3，悬停提亮。两端各留 2px（border 透明 + background-clip
+     把背景裁进 padding box），滑块才不贴着轨道边缘 —— 不裁的话它会是一根
+     顶天立地的粗条，圆角也就看不出来了。
+
+     用 ::-webkit-scrollbar 这一套，不用标准的 scrollbar-width / scrollbar-color：
+     WebView2 是 Chromium，两套都认，但**标准属性一旦设上就会盖掉伪元素那套**，
+     而圆角、悬停态、两端留白这些只有伪元素给得了。代价是这条规则在非 Chromium
+     内核里无效（这个程序只跑 WebView2，不存在这个情况）。
+
+     `color-scheme: dark`（见 :root）留着不动：它管的是 select 弹出列表、
+     number 的原生三角那些别的东西，不只是滚动条。
+
+     注意下面 #tplScroll 和 .preview 各自把滚动条藏掉了（模板页要一屏看得全）。
+     那两条是 id / class 选择器，比这里的 `::-webkit-scrollbar` 更具体，
+     照样盖得住 —— 改这里不会把它们变回来。 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--panel-3);
+    background-clip: padding-box;
+    border: 2px solid transparent;
+    border-radius: 6px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3b4454;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:active {
+    background: var(--faint);
+    background-clip: padding-box;
+  }
+  /* 两根条交汇的那一小块。不写它的话那里会留一个浅色的方块。 */
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  /* Chromium 在 Windows 上默认不画箭头按钮，但真画出来的话是原生样式，
+     和这套对不上。显式关掉，别留这个可能。 */
+  ::-webkit-scrollbar-button {
+    display: none;
+  }
+
   html, body {
     margin: 0;
     height: 100%;
@@ -184,7 +235,7 @@
   .sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
   .spacer { flex: 1; }
 
-  select, input[type=text], input[type=number], textarea {
+  select, input[type=text], input[type=number], input[type=date], textarea {
     font: inherit;
     color: var(--text);
     background: var(--panel-2);
@@ -210,6 +261,7 @@
      禁用与否由底色和边框表达就够了，没必要拿可读性去换。
      （文字若跟着变暗，对比度会掉到 3.0:1 附近，属于「运气好才过」。） */
   input[type=text]:disabled, input[type=number]:disabled,
+  input[type=date]:disabled,
   select:disabled, textarea:disabled {
     background: var(--bg);
     border-color: #1d222b;
@@ -787,9 +839,6 @@
   /* 勾选框那一列。默认的单元格 padding 会把一个 13px 的方框撑成
      一格 36px 宽、左边还空一截的样子，收窄一点。 */
   .hist td:first-child, .hist th:first-child { padding-left: 12px; }
-  /* 勾不了的（已还原 / 现名不在）要一眼看出勾不了。
-     不压暗的话它和「还没勾」长得一模一样，用户点它没反应会以为界面卡了。 */
-  .hist input[type=checkbox]:disabled { opacity: .35; cursor: not-allowed; }
 
   /* 记录页的搜索 / 筛选 / 批量还原那一行。
      单独占一行，不塞进上面的标题行：标题行右边已经有「导出」「刷新」「撤销全部」
@@ -799,6 +848,39 @@
      而「还原所选」被推到窗口最右边，跟它要操作的那张表离得太远。 */
   .histsearch { width: 280px; }
   .histcount { color: var(--faint); font-size: 12px; }
+
+  /* 自定义时间范围的两个日期框。
+     只在时间范围选到「自定义…」时露出来 —— 常驻的话，
+     预设档（今天 / 近 7 天）和这两个框同时在场，谁说了算得靠猜。 */
+  .rangegroup { display: flex; align-items: center; gap: 6px; }
+  .rangegroup span { color: var(--faint); }
+  input[type=date] { padding: 4px 7px; font-size: 12.5px; }
+
+  /* ============ 分页 ============
+     任务页和记录页共用同一套控件：每页条数 + 上一页 / 下一页 + 页码。
+
+     **分页不是为了好看，是为了不卡。** 一屏几千个 <tr> 的问题不在数据量，
+     在 DOM：跑任务时每个文件都会推一次 job:item，而每次刷新都要在那几千个
+     行节点上重算样式与布局。把行数钉在 300 以内，这件事就不存在了。
+
+     放在表格**下面、紧贴着它**，而且不画自己的边框：它说的是「这张表翻到
+     哪儿了」，而表本身已经有一个圆角边框 —— 再套一层框，中间就会多出一条
+     横线，看着就是「面板被切成两半」（这条在进度条那儿踩过一次，见 #progressBar）。 */
+  .pagerbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .pagerbar select { padding: 3px 6px; font-size: 12px; }
+  .pagerbar button { padding: 3px 9px; font-size: 12px; }
+  .pagerbar .pageinfo {
+    color: var(--faint); font-size: 12px;
+    white-space: nowrap; min-width: 96px; text-align: center;
+  }
+  /* 记录页的分页条是这一页的最后一块，下面要留出窗口底边。 */
+  #histPagerBar { margin-bottom: 14px; }
 
   /* ============ 确认弹窗 ============
      WebView 原生的 confirm() 是浅色的系统对话框，在这套深色界面里像另一个程序弹出来的。
@@ -961,7 +1043,6 @@
           </button>
           <div class="sep"></div>
           <span id="counter" class="counter">0 个任务</span>
-          <select id="selSize" title="按文件大小筛选"></select>
           <button id="btnRemove" class="ghost hidden" title="把选中的条目移出队列">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
             移除所选
@@ -983,7 +1064,7 @@
           <table>
             <thead>
               <tr>
-                <th class="c-check"><input type="checkbox" id="checkAll"></th>
+                <th class="c-check"><input type="checkbox" id="checkAll" title="全选当前筛选下的全部条目（跨页）"></th>
                 <th class="c-file">文件</th>
                 <th class="c-title">歌名</th>
                 <th class="c-artist">艺人</th>
@@ -995,6 +1076,16 @@
             </thead>
             <tbody id="tbody"></tbody>
           </table>
+        </div>
+        <!-- 分页条。长列表卡顿的根因是 DOM 里的行数，所以只有当前这一页会建行。
+             队列为空时整块收起来（见 refreshEmptyState）——那时候空状态在说话，
+             再挂一句「第 1 / 1 页」只会让人以为列表被筛空了。 -->
+        <div class="pagerbar" id="taskPagerBar">
+          <div class="spacer"></div>
+          <select id="pageSize" title="每页显示多少个"></select>
+          <button id="pagePrev">上一页</button>
+          <span class="pageinfo" id="pageInfo">—</span>
+          <button id="pageNext">下一页</button>
         </div>
         <div id="empty" class="empty grow">
           <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 10.5l4 1.5-4 1.5z" fill="currentColor" stroke="none"/></svg>
@@ -1146,9 +1237,7 @@
           <button id="btnUndoAll" class="danger">撤销全部改名</button>
         </div>
 
-        <!-- 搜索 / 筛选 / 批量还原。
-             筛选和搜索只改「看得见哪些」，不改记录本身；
-             「还原所选」只认勾上的那些，跟筛选条件无关。 -->
+        <!-- 第一行：搜索 / 筛选。只改「看得见哪些」，不改记录本身。 -->
         <div class="histbar">
           <div class="searchbox histsearch">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
@@ -1161,24 +1250,56 @@
             <option value="restored">已还原</option>
             <option value="missing">已不在</option>
           </select>
+          <!-- 时间范围。除了几档预设，还要能自己填起止日期：
+               用户找「上个月那一批」时心里装的是两个具体的日子，
+               而不是「近 30 天」这种相对量。 -->
+          <select id="histRange" aria-label="按时间范围筛选">
+            <option value="all">全部时间</option>
+            <option value="today">今天</option>
+            <option value="7d">近 7 天</option>
+            <option value="30d">近 30 天</option>
+            <option value="month">本月</option>
+            <option value="custom">自定义…</option>
+          </select>
+          <div class="rangegroup hidden" id="histRangeCustom">
+            <input type="date" id="histFrom" aria-label="起始日期">
+            <span>~</span>
+            <input type="date" id="histTo" aria-label="结束日期">
+          </div>
           <div class="spacer"></div>
           <span class="histcount" id="histCount">—</span>
+        </div>
+
+        <!-- 第二行：对哪些动手。
+             和上面那行分开是刻意的 —— 一行里塞进搜索、两个筛选、计数、
+             分页和两颗批量按钮，最小窗口宽度（960）下必然折成两层，
+             看着像排版坏了；而且「看哪些」和「改哪些」本来就是两件事。 -->
+        <div class="histbar">
+          <div class="spacer"></div>
+          <button id="btnRemoveHistory" disabled title="把勾选的记录从这一页拿掉（不碰磁盘上的文件）">移除所选</button>
           <!-- 「一键还原」不弹确认：勾哪几条本身就是确认，
                而且勾选一变就会重算这个数字，按下去之前用户一定看得到会动几个。
                真正无边界的那颗「撤销全部改名」才需要确认。 -->
           <button id="btnUndoSelected" disabled>还原所选</button>
         </div>
 
-        <div class="tablewrap grow" id="histWrap" style="margin-bottom:14px">
+        <div class="tablewrap grow" id="histWrap">
           <table class="hist">
             <thead>
               <tr>
-                <th style="width:36px"><input type="checkbox" id="histAll" title="全选当前筛出来的可还原项"></th>
+                <th style="width:36px"><input type="checkbox" id="histAll" title="全选当前筛出来的全部记录（跨页，含已还原和已不在的）"></th>
                 <th style="width:150px">时间</th><th>原名</th><th>现名</th><th style="width:82px">状态</th><th style="width:70px"></th>
               </tr>
             </thead>
             <tbody id="histBody"></tbody>
           </table>
+        </div>
+        <div class="pagerbar" id="histPagerBar">
+          <div class="spacer"></div>
+          <select id="histPageSize" title="每页显示多少条"></select>
+          <button id="histPagePrev">上一页</button>
+          <span class="pageinfo" id="histPageInfo">—</span>
+          <button id="histPageNext">下一页</button>
         </div>
         <!-- 空状态分两句说：「一条都没有」和「筛掉了」。
              混成一句的话，用户打错一个字会以为记录被清空了。 -->
@@ -1445,12 +1566,16 @@ const STATUS_FILTERS = [
   { id: 'skipped', label: '跳过', group: ['skipped'] },
 ];
 
-const SIZE_FILTERS = [
-  { id: 'all', label: '不限大小' },
-  { id: 'lt100', label: '小于 100 MB', test: (n) => n < 100 * 1024 * 1024 },
-  { id: 'gt100', label: '大于 100 MB', test: (n) => n >= 100 * 1024 * 1024 },
-  { id: 'lt1g', label: '小于 1 GB', test: (n) => n < 1024 * 1024 * 1024 },
-];
+// 这里原来还有一组 SIZE_FILTERS（不限大小 / 小于 100 MB / 大于 100 MB / 小于 1 GB）
+// 和它对应的那颗下拉。撤掉了：
+//
+//   · 这一页真正要回答的是「哪些还没处理、哪些没识别出来」，按大小切一刀
+//     和这些都对不上 —— 用户筛出来一屏，也做不了什么不一样的事；
+//   · 它占的是工具栏最右边那块最值钱的位置（挨着任务计数），而四档阈值是拍出来的，
+//     没人会正好卡在 100 MB / 1 GB 上；
+//   · 队列里本来就只有用户自己加进来的文件，按大小再筛一层是二次收窄。
+//
+// 状态筛选留着：那个直接对应「接下来该干什么」。
 
 const el = (id) => document.getElementById(id);
 const items = new Map();
@@ -1458,12 +1583,13 @@ const rows = new Map();
 const selected = new Set();
 
 let activeStatus = 'all';
-let activeSize = 'all';
 let running = false;
 let paused = false;
 let settings = null;
 let currentPane = 'log';
 let focusedIndex = -1;
+// 任务列表当前在第几页。只由 renderTasks 读写，别处一律通过改它再重画。
+let page = 1;
 
 // ---------------------------------------------------------------- 工具
 
@@ -1483,12 +1609,7 @@ function statusGroup(status) {
 }
 
 function visible(item) {
-  if (activeStatus !== 'all' && statusGroup(item.status) !== activeStatus) return false;
-  if (activeSize !== 'all') {
-    const rule = SIZE_FILTERS.find((s) => s.id === activeSize);
-    if (rule && rule.test && !rule.test(item.size || 0)) return false;
-  }
-  return true;
+  return activeStatus === 'all' || statusGroup(item.status) === activeStatus;
 }
 
 function pill(status) {
@@ -1497,6 +1618,69 @@ function pill(status) {
   span.textContent = STATUS_LABEL[status] || status;
   return span;
 }
+
+// ---------------------------------------------------------------- 分页
+//
+// 任务列表和记录列表共用同一套控件，只是各持有自己的页码。
+//
+// **分页不是为了好看，是为了不卡。** 一屏几千个 <tr> 的问题不在数据量，在 DOM：
+// 跑任务时每个文件都会推一次 job:item，而每次刷新都要在那几千个行节点上重算
+// 样式与布局。把渲染的行数钉在 300 以内，这件事就不存在了。
+//
+// 四档是拍出来的：50 是默认（一屏看得完，翻页也不频繁），
+// 300 是上限（再多就和「不分页」没区别了）。
+const PAGE_SIZES = [50, 100, 200, 300];
+
+// pager 绑一份控件，返回「读每页条数」和「重画页码」两个口子。
+//
+// 分页状态（第几页）**由调用方持有**，这里不存：两份列表各翻各的，
+// 共用一个「当前页」会互相踩。
+//
+// onChange 收到的 step 是 -1 上一页 / 1 下一页 / 0 每页条数变了
+// （0 的语义是「回到第 1 页」——换了每页条数还停在第 7 页没有意义）。
+function pager(nodes, onChange) {
+  const { size, prev, next, info } = nodes;
+
+  for (const value of PAGE_SIZES) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = value + ' 条/页';
+    size.appendChild(option);
+  }
+  size.value = String(PAGE_SIZES[0]);
+
+  size.onchange = () => onChange(0);
+  prev.onclick = () => onChange(-1);
+  next.onclick = () => onChange(1);
+
+  return {
+    // 每页条数的读取口只有这一个。别处直接读 DOM 的话，
+    // 「每页 300 条」这个状态就会有两个来源。
+    size: () => Number(size.value) || PAGE_SIZES[0],
+    paint(total, current, pages) {
+      info.textContent = total ? `第 ${current} / ${pages} 页` : '—';
+      prev.disabled = current <= 1;
+      next.disabled = current >= pages;
+    },
+  };
+}
+
+// pageSlice 把页码夹回有效范围，返回夹过之后的页码、总页数和这一页的起点。
+//
+// 夹这一步不能省：筛选一变（或者记录被移除、队列被清空），原来那个页码
+// 很可能已经越界 —— 不夹的话会渲染出一张空表，而用户手里的筛选条件看着没问题。
+function pageSlice(total, size, current) {
+  const pages = Math.max(1, Math.ceil(total / size));
+  const page = Math.min(Math.max(1, current), pages);
+  return { page, pages, start: (page - 1) * size };
+}
+
+const taskPager = pager({
+  size: el('pageSize'), prev: el('pagePrev'), next: el('pageNext'), info: el('pageInfo'),
+}, (step) => {
+  page = step === 0 ? 1 : page + step;
+  renderTasks();
+});
 
 // ---------------------------------------------------------------- 确认弹窗
 //
@@ -1692,43 +1876,111 @@ function paintRow(tr, item) {
 
   c.box.checked = selected.has(item.index);
   tr.classList.toggle('selected', selected.has(item.index));
-  tr.classList.toggle('hidden', !visible(item));
+  // 这里**不再**按筛选条件切 .hidden。分页之后渲染出来的每一行都必然可见
+  // （不可见的根本不建行，见 renderTasks），留着这个开关只会让人以为
+  // 「筛选是靠隐藏行做的」，然后某天顺手把 renderTasks 里的过滤删掉。
 }
 
+// upsert 收一条来自后端的更新。
+//
+// **只更新数据，不动 DOM 结构。** 跑任务时每个文件都会走一次这里，
+// 而它不能假设那条一定在当前页上 —— 不在的话连行都没有，硬插进来就会把
+// 分页弄乱（第 1 页里冒出第 3 页的条目）。落不到当前页的那些，数据照更新，
+// 等翻页 / 换筛选重画时自然就出来了。
+//
+// 新条目是唯一的例外：它会改变分页（可能要多出一页），只能整页重画。
+// 实际上新条目一律从 rebuild 进来，这条分支是给「将来某处直接推一条新条目」
+// 兜底的 —— 不兜的话那条会静默地不出现。
 function upsert(item) {
+  const isNew = !items.has(item.index);
   items.set(item.index, item);
-  let tr = rows.get(item.index);
-  if (!tr) {
-    tr = buildRow(item);
-    rows.set(item.index, tr);
-    el('tbody').appendChild(tr);
+  if (isNew) {
+    renderTasks();
+    return;
   }
-  paintRow(tr, item);
+  const tr = rows.get(item.index);
+  if (tr) paintRow(tr, item);
   refreshEmptyState();
+}
+
+// filteredItems 当前筛选下可见的全部条目（不分页）。
+//
+// 抽出来是因为「什么算可见」现在有两个消费者：画表格的（它只画其中一页）
+// 和算选中状态的（表头那颗全选框要跨页看）。
+function filteredItems() {
+  const list = [];
+  for (const item of items.values()) if (visible(item)) list.push(item);
+  return list;
+}
+
+// renderTasks 只画**当前这一页**。
+//
+// 这是唯一会重建 <tr> 的地方。其余路径（事件推来的单条更新、勾选、详情面板）
+// 都走 upsert / 局部刷新 —— 那些每秒会来几十次，每次重建 50 行等于把
+// 长列表的卡顿原样搬回来。
+function renderTasks() {
+  const list = filteredItems();
+  const size = taskPager.size();
+  const { page: current, pages, start } = pageSlice(list.length, size, page);
+  page = current;
+
+  const slice = list.slice(start, start + size);
+  const fragment = document.createDocumentFragment();
+  rows.clear();
+  for (const item of slice) {
+    const tr = buildRow(item);
+    rows.set(item.index, tr);
+    paintRow(tr, item);
+    // 详情面板盯着的那一行翻到别的页之后，回来时高亮要还在。
+    if (item.index === focusedIndex) tr.classList.add('focused');
+    fragment.appendChild(tr);
+  }
+
+  // 队列里明明有东西、这一页却是空的 = 筛选把东西全筛掉了。
+  // 只留一行表头会让整块看着像坏了，所以补一句说明。
+  //
+  // **队列本身为空时不补**：那种情况整张表是藏起来的（见 refreshEmptyState），
+  // 补一行反而会让「空队列」在 DOM 里看着像「有内容」。
+  if (items.size > 0 && !list.length) {
+    const tr = document.createElement('tr');
+    const td = cell('当前筛选下没有任务 —— 把右上角的「状态」切回「全部」看看', 'muted');
+    td.colSpan = 8;
+    td.style.textAlign = 'center';
+    td.style.padding = '24px 10px';
+    tr.appendChild(td);
+    fragment.appendChild(tr);
+  }
+
+  el('tbody').replaceChildren(fragment);
+  taskPager.paint(list.length, current, pages);
+  refreshEmptyState();
+  syncSelectionUI();
 }
 
 function rebuild(list) {
   items.clear();
   rows.clear();
   selected.clear();
-  el('tbody').replaceChildren();
-  for (const item of list) upsert(item);
-  refreshEmptyState();
-  syncSelectionUI();
+  for (const item of list) items.set(item.index, item);
+  // 换了一批内容（重扫 / 添加 / 还原后同步），停在第 7 页没有意义。
+  page = 1;
+  renderTasks();
 }
 
 function refreshEmptyState() {
   const any = items.size > 0;
   el('empty').style.display = any ? 'none' : 'flex';
   el('tablewrap').style.display = any ? 'block' : 'none';
+  el('taskPagerBar').classList.toggle('hidden', !any);
 }
 
+// 状态筛选变了 → 可见集合整个变了，页码回到第 1 页。
+//
+// 不回到第 1 页的话，原来在第 5 页、筛完只剩 2 页，pageSlice 会把它夹到第 2 页 ——
+// 用户看到的是一张从中间开始的表，而他刚刚才把筛选调窄。
 function repaintAll() {
-  for (const [index, tr] of rows) {
-    const item = items.get(index);
-    if (item) tr.classList.toggle('hidden', !visible(item));
-  }
-  refreshEmptyState();
+  page = 1;
+  renderTasks();
 }
 
 function syncSelectionUI() {
@@ -1736,7 +1988,16 @@ function syncSelectionUI() {
     ? `已选 ${selected.size} / 共 ${items.size} 个`
     : `${items.size} 个任务`;
   el('btnRemove').classList.toggle('hidden', selected.size === 0);
-  el('checkAll').checked = items.size > 0 && selected.size === items.size;
+
+  // 表头那颗全选框看的是**当前筛选下的全部条目**（跨页），不是这一页 ——
+  // 它和「移除所选」作用于同一个集合，两边必须一致，
+  // 否则勾满一页之后全选框还是不亮，用户会以为全选没生效。
+  //
+  // 半勾用 indeterminate 表示：不表示出来的话，用户看到空框会以为勾选丢了。
+  const list = filteredItems();
+  const picked = list.filter((item) => selected.has(item.index)).length;
+  el('checkAll').checked = list.length > 0 && picked === list.length;
+  el('checkAll').indeterminate = picked > 0 && picked < list.length;
 }
 
 // 进度条只在「正在跑」的时候才有意义。
@@ -2005,12 +2266,20 @@ window.addEventListener('drop', () => {
 
 // ---------------------------------------------------------------- 动作
 
-async function scanPath(path) {
+// scanPath **换掉整个队列**（App.ScanPath → job.Manager.Scan → collect(replace=true)）。
+//
+// 只有「添加文件夹」和「重新扫描当前目录」该走这里 —— 这两句的意思本来就是
+// 「以这个目录为准」。别处一律不许调它：那会把目录里所有别的视频一起拉进队列，
+// 而调用方想要的往往只是刷新名字（还原之后那条就踩过这个坑，见 refreshAfterRestore）。
+//
+// reason 只用来写日志。用户报「列表自己长出来了」的时候，日志里那一行是唯一
+// 能指出「是哪一下长出来的」的证据 —— 光看「已载入 37 个文件」看不出来源。
+async function scanPath(path, reason) {
   if (!path) return;
   try {
     const list = await App.ScanPath(path);
     rebuild(list);
-    log('INFO', `已载入 ${list.length} 个文件：${path}`);
+    log('INFO', `已载入 ${list.length} 个文件：${path}（${reason}）`);
   } catch (error) {
     log('ERROR', String(error));
   }
@@ -2023,6 +2292,9 @@ async function addPaths(paths) {
     rebuild(result.items);
     if (result.added > 0) log('INFO', `新增 ${result.added} 个文件，队列共 ${result.items.length} 个`);
     else log('WARN', '这次没有新增文件（可能已经在队列里了）');
+    // 拖进来的是文件夹时，一次会带进来一批。报出是哪个文件夹带进来的 ——
+    // 不报的话用户只看到列表凭空多出一堆文件。
+    for (const line of result.expanded || []) log('INFO', '展开目录 ' + line);
     // 被挡下的必须说出来，否则用户只会看到「拖了没反应」。
     for (const line of result.rejected || []) log('WARN', '已跳过 ' + line);
   } catch (error) {
@@ -2037,14 +2309,13 @@ el('btnAddFiles').onclick = async () => {
 
 el('btnAddFolder').onclick = async () => {
   const path = await App.PickFolder();
-  if (path) scanPath(path);
+  if (path) scanPath(path, '添加文件夹');
 };
 
 el('btnRescan').onclick = async () => {
   const list = await App.Items();
   if (!list.length) { log('WARN', '还没有目录可以重扫'); return; }
-  log('INFO', '重新扫描 ' + list[0].dir);
-  scanPath(list[0].dir);
+  scanPath(list[0].dir, '重新扫描当前目录');
 };
 
 async function start(scope) {
@@ -2080,8 +2351,11 @@ el('btnRemove').onclick = async () => {
 
 el('checkAll').onchange = (e) => {
   selected.clear();
+  // 全选作用于**当前筛选下的全部条目**，不只是这一页 ——
+  // 勾选集合是跨页的，「移除所选」按的也是同一个集合。
+  // 页面上那颗框亮不亮由 syncSelectionUI 按同一份数据算，两边不会分叉。
   if (e.target.checked) {
-    for (const item of items.values()) if (visible(item)) selected.add(item.index);
+    for (const item of filteredItems()) selected.add(item.index);
   }
   for (const [index, tr] of rows) {
     const on = selected.has(index);
@@ -2118,13 +2392,6 @@ for (const f of STATUS_FILTERS) {
   el('selStatus').appendChild(option);
 }
 el('selStatus').onchange = (e) => { activeStatus = e.target.value; repaintAll(); };
-
-for (const s of SIZE_FILTERS) {
-  const option = document.createElement('option');
-  option.value = s.id; option.textContent = s.label;
-  el('selSize').appendChild(option);
-}
-el('selSize').onchange = (e) => { activeSize = e.target.value; repaintAll(); };
 
 for (const tab of document.querySelectorAll('.tab')) {
   tab.onclick = () => {
@@ -3029,7 +3296,11 @@ function historyOps(entry) {
 // canRestore 只有「现名还在磁盘上、而且没还原过」的记录才动得了。
 //
 // 三种状态里只有这一种是「能还原」。另外两种按下去也只会得到
-// 「文件已不在」或者「已经还原过了」——那就不该给按钮、也不该给勾选框。
+// 「文件已不在」或者「已经还原过了」——那就不该给「还原」按钮。
+//
+// 注意这个判断**只挡「还原」**，不挡勾选：勾选是记录级的，而「移除记录」
+// 对三种状态一样有效 —— 「已还原」的那些恰恰是最该清理的（它们已经没事可做了）。
+// 以前勾选框也跟着禁用，于是「清理记录」这件事根本做不了。
 function canRestore(entry) {
   return !!entry.exists && !entry.restored;
 }
@@ -3045,15 +3316,73 @@ function canRestore(entry) {
 
 let historyEntries = [];
 const historyPicked = new Set();
+// 当前这一页真正画出来的那批（按屏幕顺序）。shift 连选要按**屏幕位置**算范围，
+// 而位置只有这里知道 —— 从 DOM 反查的话，同一个 to 出现两次时会对不上。
+let historyRendered = [];
+// 上一次点的那一格在 historyRendered 里的下标；null = 还没有锚点。
+// 每次重画都清掉：翻页 / 换筛选之后那个下标指的是另一条记录了。
+let historyAnchor = null;
+let historyPage = 1;
+
+const historyPager = pager({
+  size: el('histPageSize'), prev: el('histPagePrev'),
+  next: el('histPageNext'), info: el('histPageInfo'),
+}, (step) => {
+  historyPage = step === 0 ? 1 : historyPage + step;
+  renderHistory();
+});
+
+// historyRange 当前的时间范围，返回 [起点, 终点) 两个毫秒值；不筛的返回 null。
+//
+// 边界按**本地日**算，而且右端是半开区间（到「那一天结束」= 次日 00:00）。
+// 直接用终点那天的 00:00 会把当天整个漏掉 —— 而「今天」正好是最常选的一天。
+//
+// 自定义那档允许只填一头：只填「起」看的是「从那以后」，只填「止」看的是
+// 「到那天为止」，两头都空等于不筛。逼着两头都填的话，用户想「只看今天之后」
+// 还得再编一个未来的日期。
+function historyRange() {
+  const mode = el('histRange').value;
+  const day = 24 * 60 * 60 * 1000;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const startOfToday = today.getTime();
+
+  if (mode === 'today') return [startOfToday, startOfToday + day];
+  if (mode === '7d') return [startOfToday - 6 * day, startOfToday + day];
+  if (mode === '30d') return [startOfToday - 29 * day, startOfToday + day];
+  if (mode === 'month') {
+    const first = new Date(today);
+    first.setDate(1);
+    return [first.getTime(), startOfToday + day];
+  }
+  if (mode === 'custom') {
+    const dayStart = (value) => {
+      const parsed = Date.parse(value + 'T00:00:00');
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const from = el('histFrom').value ? dayStart(el('histFrom').value) : null;
+    const to = el('histTo').value ? dayStart(el('histTo').value) + day : null;
+    return [from, to];
+  }
+  return null;
+}
 
 // historyMatches 一条记录过不过当前的筛选和搜索。
 //
 // 三种状态互斥：已还原 / 可还原 / 已不在。已还原的记录现名当然不在磁盘上，
 // 所以「已不在」这一档必须显式排掉 restored，否则它会同时出现在两档里。
-function historyMatches(entry, mode, needle) {
+function historyMatches(entry, mode, needle, range) {
   if (mode === 'undoable' && !canRestore(entry)) return false;
   if (mode === 'restored' && !entry.restored) return false;
   if (mode === 'missing' && (entry.restored || entry.exists)) return false;
+
+  if (range) {
+    const [from, to] = range;
+    if (from !== null && entry.ts < from) return false;
+    if (to !== null && entry.ts >= to) return false;
+  }
+
   if (!needle) return true;
   // 搜整条路径，不只搜文件名：用户多半记得「D:\演唱会\那一批」，
   // 而记不住当时被改成什么名字。
@@ -3064,7 +3393,7 @@ function historyMatches(entry, mode, needle) {
     .toLowerCase().includes(needle);
 }
 
-// paintHistoryBar 按当前看得见的那批行更新计数、全选框和按钮。
+// paintHistoryBar 按当前看得见的那批行更新计数、全选框和两颗按钮。
 //
 // 这里**故意不做**「把已经不在列表里的勾选剪掉」那一步。试过，删了：
 // 剪枝和 restorePicked 里那句「目标从可见行推导」是两套等价的安全机制，
@@ -3076,18 +3405,30 @@ function historyMatches(entry, mode, needle) {
 // 搜索清空之后，原来勾的那几条还是勾着的。这是可以接受的 ——
 // 数字始终等于屏幕上勾着的行数，只是会随筛选回来。
 function paintHistoryBar(rows) {
-  const pickable = rows.filter(canRestore);
-  const picked = pickable.filter((entry) => historyPicked.has(entry.to)).length;
+  // 两颗按钮认的不是同一批：
+  //   · 「还原所选」只对**可还原**的生效（另外两种点了也只会得到一句「跳过」）；
+  //   · 「移除所选」对三种状态一样生效 —— 记录就是记录。
+  // 混成一个数字的话，勾了 5 条（其中 2 条已还原）会看到「还原所选（5）」，
+  // 按下去却只动 3 个，而按钮上那个数字正是用户唯一的预期来源。
+  const restorable = rows.filter(canRestore);
+  const pickedRestore = restorable.filter((entry) => historyPicked.has(entry.to)).length;
+  const picked = rows.filter((entry) => historyPicked.has(entry.to)).length;
 
-  el('btnUndoSelected').disabled = picked === 0;
-  el('btnUndoSelected').textContent = picked ? `还原所选（${picked}）` : '还原所选';
+  el('btnUndoSelected').disabled = pickedRestore === 0;
+  el('btnUndoSelected').textContent = pickedRestore
+    ? `还原所选（${pickedRestore}）` : '还原所选';
 
-  // 全选框只管**当前筛出来的可还原项**。用 indeterminate 表示「勾了一部分」：
-  // 不表示出来的话，用户看到空框会以为自己的勾选被清掉了。
+  el('btnRemoveHistory').disabled = picked === 0;
+  el('btnRemoveHistory').textContent = picked
+    ? `移除所选（${picked}）` : '移除所选';
+
+  // 全选框看的是**当前筛出来的全部记录**（不只是可还原的），因为勾选本身
+  // 就是记录级的。用 indeterminate 表示「勾了一部分」：不表示出来的话，
+  // 用户看到空框会以为自己的勾选被清掉了。
   const all = el('histAll');
-  all.disabled = pickable.length === 0;
-  all.checked = pickable.length > 0 && picked === pickable.length;
-  all.indeterminate = picked > 0 && picked < pickable.length;
+  all.disabled = rows.length === 0;
+  all.checked = rows.length > 0 && picked === rows.length;
+  all.indeterminate = picked > 0 && picked < rows.length;
 
   el('histCount').textContent = rows.length === historyEntries.length
     ? `${historyEntries.length} 条`
@@ -3105,30 +3446,54 @@ function syncHistoryPicks() {
 }
 
 // historyPickCell 画出那一格的勾选框。
-function historyPickCell(entry) {
+//
+// position 是这一行在 historyRendered 里的下标 —— shift 连选要按屏幕位置
+// 算范围，而位置只有调用方（renderHistory）知道。
+function historyPickCell(entry, position) {
   const td = document.createElement('td');
   const box = document.createElement('input');
   box.type = 'checkbox';
   box.dataset.to = entry.to;
-
-  if (!canRestore(entry)) {
-    // 勾不了的就别给勾：勾了也只会得到一句「跳过」，
-    // 而用户会以为这一批能救回来。
-    box.disabled = true;
-    box.title = entry.restored ? '这条已经还原过了' : '现名那个文件已经不在磁盘上';
-    td.appendChild(box);
-    return td;
-  }
-
   box.checked = historyPicked.has(entry.to);
-  box.title = '勾上这条，再点右边的「还原所选」一起改回去';
-  box.onchange = () => {
-    if (box.checked) historyPicked.add(entry.to);
-    else historyPicked.delete(entry.to);
+  box.title = '勾上这条；按住 Shift 点可以连选一段';
+
+  box.onclick = (event) => {
+    // shift 连选：把「上次点的那一格」到这一格之间的可勾行，一起设成这一格
+    // 现在的状态。一屏几百条时一条条点不现实，而「全选」又太粗 ——
+    // 用户往往只要中间一段。
+    //
+    // 锚点不在当前页上时（翻过页、换过筛选）就退化成普通单选：
+    // 硬算一个跨越两页的范围，等于替用户勾了他没看见的东西。
+    if (event.shiftKey && historyAnchor !== null) {
+      pickRange(historyAnchor, position, box.checked);
+    } else if (box.checked) {
+      historyPicked.add(entry.to);
+    } else {
+      historyPicked.delete(entry.to);
+    }
+    historyAnchor = position;
     syncHistoryPicks();
   };
+
   td.appendChild(box);
   return td;
+}
+
+// pickRange 把 anchor 到 position 之间（含两端）的每一格设成 checked。
+//
+// 只设 checked，**不改变**那一段里其他行的勾选状态 —— shift 选的是
+// 「这一段归我管」，不是「这一段全部变勾」。
+//
+// 同一个 to 出现两次时两行会一起勾上（勾选集合装的是路径，见上面那段说明），
+// syncHistoryPicks 会把两份 DOM 都同步过去。
+function pickRange(anchor, position, checked) {
+  const [lo, hi] = anchor <= position ? [anchor, position] : [position, anchor];
+  for (let i = lo; i <= hi; i++) {
+    const entry = historyRendered[i];
+    if (!entry) continue;
+    if (checked) historyPicked.add(entry.to);
+    else historyPicked.delete(entry.to);
+  }
 }
 
 // restoreOne 把单个文件改回原名。
@@ -3184,57 +3549,89 @@ async function restorePicked() {
   loadHistory();
 }
 
-// visibleHistoryRows 当前筛选和搜索之下看得见的那批记录。
+// visibleHistoryRows 当前筛选 / 搜索 / 时间范围之下看得见的那批记录。
 //
 // 抽出来是因为「什么算看得见」现在有三个消费者：画表格的、更新汇总栏的、
 // 以及决定「按下去会动哪些文件」的。三处各写一遍迟早会分叉 ——
 // 而分叉的方向恰好是「按钮说 1 个、实际动 3 个」。
+//
+// **它返回的是全部命中项，不分页。** 分页只影响「一次画多少行」，
+// 不影响「什么算看得见」—— 两件事混在一起的话，翻一页就会让
+// 「还原所选」的计数跟着变，而用户什么都没勾。
 function visibleHistoryRows() {
   const mode = el('histFilter').value;
   const needle = el('histSearch').value.trim().toLowerCase();
-  return historyEntries.filter((entry) => historyMatches(entry, mode, needle));
+  const range = historyRange();
+  return historyEntries.filter((entry) => historyMatches(entry, mode, needle, range));
 }
 
-// refreshAfterRestore 还原之后把队列重新扫一遍。
+// refreshAfterRestore 还原之后让队列跟上磁盘。
 //
-// 不扫的话列表里还留着改名后的名字，用户会以为还原没生效 ——
+// 不刷新的话列表里还留着改名后的名字，用户会以为还原没生效 ——
 // 而文件其实已经改回去了。
+//
+// **必须用 App.ResyncQueue()，不能扫目录。** 这里原来调的是
+// `scanPath(list[0].dir)`，而 scanPath 走的是 App.ScanPath —— 那是
+// 「整目录重扫 + 整表替换」。于是「还原一个文件」的副作用变成了
+// 「把这个目录下所有视频都拉进队列」：用户拖进来一个文件跑完，去记录页
+// 转一圈回来，列表里就多出了同目录的其他所有视频。
+//
+// ResyncQueue 只更新**已经入列**的条目（按文件身份把换了名字的那些对回
+// 实际路径），既不新增也不删除。队列里有什么，只由「添加文件 / 添加文件夹 /
+// 拖入」决定。
 async function refreshAfterRestore() {
-  const list = await App.Items();
-  if (list.length) scanPath(list[0].dir);
+  try {
+    rebuild(await App.ResyncQueue());
+  } catch (error) {
+    log('ERROR', String(error));
+  }
 }
 
 function renderHistory() {
-  const body = el('histBody');
-  body.replaceChildren();
-
   const rows = visibleHistoryRows();
 
-  el('histWrap').style.display = rows.length ? 'block' : 'none';
+  // 只画当前这一页。记录攒到几千条之后，一屏几千个 <tr> 每次刷新都要重排 ——
+  // 和任务页同一个道理（见 renderTasks）。
+  const size = historyPager.size();
+  const { page: current, pages, start } = pageSlice(rows.length, size, historyPage);
+  historyPage = current;
+  const slice = rows.slice(start, start + size);
 
-  // 两种「空」要分开说：一条记录都没有，和筛完没剩下。
-  // 混成一句的话，用户打错一个字会以为记录被清空了。
-  const empty = el('histEmpty');
-  empty.style.display = rows.length ? 'none' : 'flex';
-  const none = historyEntries.length === 0;
-  el('histEmptyTitle').textContent = none ? '还没有改名记录' : '没有符合条件的记录';
-  el('histEmptyNote').textContent = none
-    ? '每次改名都会记一行，还原就是照这份记录倒着改回去。'
-    : '换个关键词，或者把筛选切回「全部」。';
-
-  for (const entry of rows) {
+  const fragment = document.createDocumentFragment();
+  slice.forEach((entry, position) => {
     const tr = document.createElement('tr');
     tr.append(
-      historyPickCell(entry),
+      historyPickCell(entry, position),
       cell(formatTime(entry.ts)),
       pathCell(entry.from, 'mono muted'),
       historyNowCell(entry),
       historyState(entry),
       historyOps(entry),
     );
-    body.appendChild(tr);
-  }
+    fragment.appendChild(tr);
+  });
+  el('histBody').replaceChildren(fragment);
 
+  // 重画之后屏幕上的位置全变了，锚点必须作废 ——
+  // 留着的话下一次 shift 连选会按旧下标圈一段，圈的却不是用户以为的那一段。
+  historyRendered = slice;
+  historyAnchor = null;
+
+  const showTable = rows.length > 0;
+  el('histWrap').classList.toggle('hidden', !showTable);
+  el('histPagerBar').classList.toggle('hidden', !showTable);
+
+  // 两种「空」要分开说：一条记录都没有，和筛完没剩下。
+  // 混成一句的话，用户打错一个字会以为记录被清空了。
+  const empty = el('histEmpty');
+  empty.style.display = showTable ? 'none' : 'flex';
+  const none = historyEntries.length === 0;
+  el('histEmptyTitle').textContent = none ? '还没有改名记录' : '没有符合条件的记录';
+  el('histEmptyNote').textContent = none
+    ? '每次改名都会记一行，还原就是照这份记录倒着改回去。'
+    : '换个关键词，或者把状态、时间范围切回「全部」。';
+
+  historyPager.paint(rows.length, current, pages);
   paintHistoryBar(rows);
 }
 
@@ -3252,27 +3649,84 @@ el('btnRefreshHistory').onclick = loadHistory;
 
 // 搜索和筛选只改「看得见哪些」，**不清空勾选**。
 //
-// 清空是最省事的写法，但没必要：安全靠的是 restorePicked 里那个推导 ——
-// 它保证送出去的永远只是「此刻看得见、可还原」的那几条。既然危险在那儿已经挡住了，
-// 再无条件清一遍就只是白扔掉用户刚勾好的东西：
+// 清空是最省事的写法，但没必要：安全靠的是 restorePicked / removePicked 里
+// 那个推导 —— 它保证送出去的永远只是「此刻看得见」的那几条。既然危险在那儿
+// 已经挡住了，再无条件清一遍就只是白扔掉用户刚勾好的东西：
 // 勾了三条 → 想换个词再看看 → 三条全没了，得重新勾。
 //
-// 所以这里的行为是：勾选一直留着（哪怕被筛掉），
+// 所以这里的行为是：勾选一直留着（哪怕被筛掉，哪怕翻到别的页），
 // 而按钮上的数字始终等于屏幕上勾着的行数，按下去也只动那些。
 el('histSearch').oninput = renderHistory;
 el('histFilter').onchange = renderHistory;
 
-el('histAll').onchange = () => {
-  const pickable = visibleHistoryRows().filter(canRestore);
+// 时间范围：切到「自定义…」才把两个日期框露出来。
+//
+// 预设档和日期框同时在场的话，谁说了算得靠猜 —— 所以是二选一，不是叠加。
+el('histRange').onchange = () => {
+  const custom = el('histRange').value === 'custom';
+  el('histRangeCustom').classList.toggle('hidden', !custom);
+  renderHistory();
+};
+el('histFrom').onchange = renderHistory;
+el('histTo').onchange = renderHistory;
 
-  // 只动当前看得见的那批，不碰别的：全选框在筛选之后显示的是「这一批」的状态，
+el('histAll').onchange = () => {
+  // 全选作用于**当前筛出来的全部记录**，不只是可还原的那些 ——
+  // 勾选是记录级的，而「移除所选」对三种状态一样有效。
+  const selectable = visibleHistoryRows();
+
+  // 只动当前筛出来的那批，不碰别的：全选框在筛选之后显示的是「这一批」的状态，
   // 取消勾选却把看不见的也一起清掉，那就对不上了。
-  if (el('histAll').checked) pickable.forEach((entry) => historyPicked.add(entry.to));
-  else pickable.forEach((entry) => historyPicked.delete(entry.to));
+  if (el('histAll').checked) selectable.forEach((entry) => historyPicked.add(entry.to));
+  else selectable.forEach((entry) => historyPicked.delete(entry.to));
   syncHistoryPicks();
 };
 
 el('btnUndoSelected').onclick = restorePicked;
+
+// removePicked 把勾上的记录从记录页拿掉。
+//
+// 和还原一样，目标从**当前看得见的那批行**里推 —— 按钮上的数字和真正会
+// 消失的条数必须相等（见 restorePicked 那段）。这里连 canRestore 都不筛：
+// 「已还原」「已不在」的记录同样能移除，它们往往才是最该清理的。
+//
+// **这颗按钮要确认，而「还原所选」不用。** 还原错了再改回去就行，
+// 记录拿掉了就再也查不到「这个文件原来叫什么」—— 那是一份不可再生的东西。
+// 而且这一批里只要有还能还原的，就是一次有代价的删除，走危险色。
+async function removePicked() {
+  const targets = visibleHistoryRows()
+    .filter((entry) => historyPicked.has(entry.to))
+    .map((entry) => entry.to);
+  if (!targets.length) return;
+
+  const undoable = visibleHistoryRows()
+    .filter((entry) => historyPicked.has(entry.to) && canRestore(entry)).length;
+
+  if (!await askConfirm({
+    title: '移除记录',
+    body: `把勾选的 ${targets.length} 条记录从这一页拿掉。\n` +
+      (undoable ? `其中 ${undoable} 条现在还能还原 —— 拿掉之后就再也改不回原名了。\n` : '') +
+      '磁盘上的文件不会被删除，名字也不会变。',
+    ok: '移除',
+    danger: undoable > 0,
+  })) return;
+
+  try {
+    // 后端返回的就是移除之后的完整列表，不用再跑一趟 History()。
+    historyEntries = await App.RemoveHistory(targets) || [];
+    // 拿掉的这些从勾选集合里清掉，剩下的留着 ——
+    // 它们还在（只是可能被筛掉了），清掉等于白扔用户刚勾的。
+    for (const to of targets) historyPicked.delete(to);
+    // 「移除了几条」这句由后端写日志（logf），它会经 job:log 事件回到这里 ——
+    // 前端再写一遍就是两条一模一样的。而且后端那条还落进了日志文件，
+    // 一次丢后悔药的操作事后要能查出来。
+  } catch (error) {
+    log('ERROR', String(error));
+  }
+  renderHistory();
+}
+
+el('btnRemoveHistory').onclick = removePicked;
 
 el('btnUndoAll').onclick = async () => {
   if (!await askConfirm({

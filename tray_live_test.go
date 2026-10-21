@@ -75,20 +75,33 @@ func TestTrayLiveSmoke(t *testing.T) {
 		t.Fatal("图标句柄是 0——CreateIconFromResourceEx 没接受这份 DIB")
 	}
 
-	// applyIcon 会把「实际用了哪一档」写进日志，这是 DPI 生效与否的客观信号。
+	// applyIcon 只在**失败路径**上写日志，所以「一条日志都没有」就等于图标这条路
+	// 整条通了：解析 ICO → 按 DPI 挑档 → CreateIconFromResourceEx。
+	//
+	// 这里以前是 grep 一句「托盘图标已就绪：24×24（系统要求 24×24）」。那行已经
+	// 从生产路径上删掉了：它从不指示任何需要用户动手的事，用户也没法从那串数字里
+	// 得出什么结论，纯粹是每次启动往日志面板里塞的一行噪声。断言顺势收成「零日志」，
+	// 反而比找某句话更严——失败路径有三条，找一句话只能盖住其中一条。
 	mu.Lock()
 	joined := strings.Join(logs, "\n")
 	mu.Unlock()
-	t.Logf("托盘日志:\n%s", joined)
-
-	if !strings.Contains(joined, "托盘图标已就绪") {
-		t.Fatalf("没有看到图标就绪的日志，说明 applyIcon 中途失败了:\n%s", joined)
+	if joined != "" {
+		t.Fatalf("applyIcon 中途失败了（它只在失败时写日志）:\n%s", joined)
 	}
 
 	// 刷新与气泡都走 PostMessage，不能 panic、不能卡住。
 	tray.Refresh()
 	tray.Balloon(trayAppName, "冒烟测试")
 	time.Sleep(300 * time.Millisecond)
+
+	// Refresh 会在托盘线程上**再跑一次** applyIcon（换 DPI、换缩放时会走这条路）。
+	// 这一轮同样不该产生日志。
+	mu.Lock()
+	afterRefresh := strings.Join(logs, "\n")
+	mu.Unlock()
+	if afterRefresh != "" {
+		t.Fatalf("刷新之后出现了日志，说明 applyIcon 这一次失败了:\n%s", afterRefresh)
+	}
 
 	// 拆掉。Dispose 是异步的（投一条 WM_CLOSE），给消息循环一点时间跑完收尾。
 	tray.Dispose()

@@ -780,6 +780,11 @@ type AddPathsResult struct {
 	// 必须回报：拖了一堆东西进来却什么都没发生，用户没法知道是程序坏了
 	// 还是那些文件本来就不该处理。
 	Rejected []string `json:"rejected"`
+	// Expanded 是这次被**展开**的文件夹，形如「路径（展开出 N 个文件）」。
+	//
+	// 拖一个文件进来只该多一条；一次多出一大片时，用户得能看出来是哪一步
+	// 带进来的 —— 否则「列表自己长出来了」就是唯一的解释。
+	Expanded []string `json:"expanded"`
 }
 
 // AddPaths 接收拖进来的路径：文件夹展开扫描，文件直接入列，结果并入现有列表。
@@ -792,13 +797,25 @@ func (a *App) AddPaths(paths []string) (AddPathsResult, error) {
 
 	var list []job.Item
 	var rejected []string
+	var expanded []string
+	previous := before
 	for _, path := range paths {
 		merged, err := a.manager.Append(path)
 		if err != nil {
 			rejected = append(rejected, filepath.Base(path)+"："+scanReason(err))
 			continue
 		}
+		delta := len(merged) - previous
+		previous = len(merged)
 		list = merged
+
+		// 拖进来的如果是个**文件夹**，这一步会一次带进来一批。报出来：
+		// 不报的话用户只看到列表凭空多出一堆文件，不知道是哪一下带进来的。
+		if delta > 1 {
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				expanded = append(expanded, fmt.Sprintf("%s（展开出 %d 个文件）", path, delta))
+			}
+		}
 	}
 
 	if list == nil {
@@ -816,6 +833,7 @@ func (a *App) AddPaths(paths []string) (AddPathsResult, error) {
 		Items:    list,
 		Added:    len(list) - before,
 		Rejected: rejected,
+		Expanded: expanded,
 	}, nil
 }
 
@@ -836,6 +854,13 @@ func scanReason(err error) string {
 
 // Items 返回当前列表，用于界面刷新后重建。
 func (a *App) Items() []job.Item { return a.manager.Items() }
+
+// ResyncQueue 让队列跟上磁盘：把「文件已经换了名字」的条目对回实际路径。
+//
+// 它**不会往队列里加文件**，也不会删 —— 只在已经入列的条目上刷新路径与名字。
+// 还原之后前端调它，而不是去重扫目录（见 job.Manager.ResyncQueue 的长注释：
+// 重扫目录会把同目录其他所有视频一起拉进队列，那正是用户报的问题）。
+func (a *App) ResyncQueue() []job.Item { return a.manager.ResyncQueue() }
 
 // Progress 返回当前进度。
 func (a *App) Progress() job.Progress { return a.manager.Progress() }
@@ -896,6 +921,14 @@ func (a *App) IsPaused() bool { return a.manager.IsPaused() }
 
 // History 返回改名记录，最新的在前。
 func (a *App) History() ([]job.HistoryEntry, error) { return a.manager.History() }
+
+// RemoveHistory 把指定的记录从记录页拿掉，参数是每条记录**现名**的完整路径。
+//
+// 只动记录，不碰磁盘：文件本身和它现在的名字都不变，代价是拿掉之后就
+// 再也还原不回原名了。所以前端那颗按钮带确认，文案里也写明了这一点。
+func (a *App) RemoveHistory(targets []string) ([]job.HistoryEntry, error) {
+	return a.manager.RemoveHistory(targets)
+}
 
 // RemoveItems 把指定下标的条目移出队列。只动队列，不碰磁盘。
 func (a *App) RemoveItems(indices []int) []job.Item { return a.manager.Remove(indices) }
@@ -1092,10 +1125,15 @@ func (a *App) RevealPath(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("路径是空的")
 	}
+	// 这一句不只是给用户看「文件已经不在了」：它同时保证了下面手拼的命令行里
+	// 不会出现 `"`（Windows 文件名里不允许有），所以不存在注入面。
 	if _, err := os.Stat(path); err != nil {
 		return errors.New("文件已经不在了")
 	}
-	return exec.Command("explorer", "/select,"+path).Start()
+	// 命令行**必须**由 winproc 手拼，不能让 os/exec 按参数去拼：
+	// 路径一带空格，os/exec 会把整个 `/select,路径` 包进引号，explorer 认不出
+	// 那个开关，会打开「文档」而不是文件所在目录。详见 winproc.RevealCommand。
+	return winproc.RevealCommand(path).Start()
 }
 
 // OpenURL 用默认浏览器打开链接（Shazam 页面）。

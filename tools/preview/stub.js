@@ -138,6 +138,9 @@
     ScanPath: () => wait(items),
     AddPaths: () => wait(items),
     Items: () => wait(items),
+    // 还原之后让队列跟上磁盘。**不新增也不删除**，只更新已入列的条目，
+    // 所以这里照原样回一份 items 就够预览用了。
+    ResyncQueue: () => wait(items),
     RemoveItems: () => wait(items),
     Clear: () => wait(null),
     Start: () => wait(null),
@@ -199,6 +202,16 @@
         text: '0_VID_20240103_210455', empty: false },
     ]),
     History: () => wait(history),
+    // 移除记录。桩里按「勾了几条就少几条」真的改一遍这份数组，
+    // 这样界面上「移除所选（2）」和点完之后剩下的行数能对上 ——
+    // 返回一个原样不动的列表，截图里就看不出这个功能到底有没有生效。
+    RemoveHistory: (targets) => {
+      const drop = new Set(targets || []);
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (drop.has(history[i].to)) history.splice(i, 1);
+      }
+      return wait(history);
+    },
     // 形状必须和 Go 的 job.UndoResult 一致（restored / missing / skipped / details）。
     // 以前这里写的是 {restored, failed, message}，界面上打出来的是 undefined。
     Undo: () => wait({ restored: 1, missing: 0, skipped: 0, details: [] }),

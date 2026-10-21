@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -524,6 +525,94 @@ func TestUndoOneRestoresOnlyThatFile(t *testing.T) {
 	}
 }
 
+// TestResyncQueueFollowsRestoreWithoutImportingTheFolder 盯两件事：
+//
+//  1. 还原之后队列里那条要跟上磁盘 —— 文件回到旧名字了，队列不能再挂着新名字，
+//     否则界面上留着一个磁盘上并不存在的文件名；
+//  2. **队列不能因此变长**。目录里那些从没入过列的视频，一个都不许进来。
+//
+// 第 2 条是重点，也是用户报的那条：「拖进来一个文件跑完，去记录页转一圈回来，
+// 列表里多出了同目录的所有视频」。以前这件事是前端调
+// `ScanPath(队列第一个文件的目录)` 做的，而 ScanPath 是整目录重扫 + **整表替换** ——
+// 「刷新一下名字」的副作用变成了「把这个目录整个拉进队列」。
+func TestResyncQueueFollowsRestoreWithoutImportingTheFolder(t *testing.T) {
+	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
+		"clip.mp4": matched("Back In Black", "AC/DC"),
+	}}
+	dir, manager, write := newHarness(t, baseConfig(), fake)
+	write("clip.mp4")
+
+	if _, err := manager.Scan(dir); err != nil {
+		t.Fatal(err)
+	}
+	run(t, manager, ScopePending)
+
+	// 目录里再放两个**从没入过列**的视频。它们就是「不该被带进来」的那一批 ——
+	// 有它们在场，这条测试才能分辨「队列没长」和「队列长了但恰好没长太多」。
+	write("stranger-a.mp4")
+	write("stranger-b.mp4")
+
+	if _, err := manager.UndoOne(filepath.Join(dir, "Back In Black.mp4")); err != nil {
+		t.Fatalf("还原失败: %v", err)
+	}
+
+	items := manager.ResyncQueue()
+
+	if len(items) != 1 {
+		names := make([]string, 0, len(items))
+		for _, item := range items {
+			names = append(names, item.Name)
+		}
+		t.Fatalf("队列里应当仍然只有原来那 1 条，实际 %d 条：%v\n"+
+			"刷新队列**只更新已经入列的条目**，绝不把目录里别的东西带进来",
+			len(items), names)
+	}
+
+	if want := filepath.Join(dir, "clip.mp4"); items[0].Path != want {
+		t.Errorf("队列里那条没跟上磁盘\n  实际: %s\n  期望: %s", items[0].Path, want)
+	}
+	if items[0].Name != "clip.mp4" {
+		t.Errorf("名字没跟上磁盘，实际 %q", items[0].Name)
+	}
+	// 文件已经回到旧名字，再挂着「新文件名」和「已改名」就是在说假话。
+	if items[0].NewName != "" || items[0].NewPath != "" {
+		t.Errorf("「新文件名」不该还挂着：%q / %q", items[0].NewName, items[0].NewPath)
+	}
+	if items[0].Status != StatusPending {
+		t.Errorf("还原之后应当回到「待处理」，实际 %q", items[0].Status)
+	}
+}
+
+// TestResyncQueueIsNoopWhenNothingMoved 磁盘没动过时，刷新不该改任何东西。
+//
+// 这条挡的是「刷新顺手把状态重置了」：那样每点一次还原，跑完的那一批全变回
+// 「待处理」，进度条跟着归零 —— 看起来像任务白跑了。
+func TestResyncQueueIsNoopWhenNothingMoved(t *testing.T) {
+	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
+		"clip.mp4": matched("Back In Black", "AC/DC"),
+	}}
+	dir, manager, write := newHarness(t, baseConfig(), fake)
+	write("clip.mp4")
+
+	if _, err := manager.Scan(dir); err != nil {
+		t.Fatal(err)
+	}
+	run(t, manager, ScopePending)
+
+	before := manager.Items()
+	items := manager.ResyncQueue()
+
+	if len(items) != len(before) {
+		t.Fatalf("条数不该变：%d -> %d", len(before), len(items))
+	}
+	for i := range before {
+		// Item 里有 map（Titles / Artists），不能直接比 —— 用 DeepEqual。
+		if !reflect.DeepEqual(items[i], before[i]) {
+			t.Fatalf("第 %d 条被改动了\n  之前: %+v\n  之后: %+v", i, before[i], items[i])
+		}
+	}
+}
+
 // TestUndoOneKeepsTheRecord 还原过之后记录仍然在，只是标成「已还原」。
 //
 // 记录**不删**是刻意的：「记录原文件名」本身就是那一页的用处。
@@ -598,6 +687,142 @@ func TestUndoKeepsTheRecordSoItCanStillBeRead(t *testing.T) {
 	// 那种反馈和「撤销成功但没生效」长得一模一样。
 	if _, err := manager.Undo(); err == nil {
 		t.Error("已经没有可撤销的记录，第二次撤销应当报错")
+	}
+}
+
+// TestRemoveHistoryDropsOnlyTheChosenRecord 移除记录只拿掉点名的那条。
+//
+// 这一页是「文件原来叫什么」的唯一备忘，而移除是一次**丢后悔药**的操作：
+// 多拿掉一条 = 那个文件再也还原不回原名，而且界面上不会有任何痕迹。
+// 所以这里同时钉住两件事：该走的走了、不该动的一个都没动。
+func TestRemoveHistoryDropsOnlyTheChosenRecord(t *testing.T) {
+	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
+		"clip.mp4":  matched("Back In Black", "AC/DC"),
+		"other.mp4": matched("Thunderstruck", "AC/DC"),
+	}}
+	dir, manager, write := newHarness(t, baseConfig(), fake)
+	write("clip.mp4")
+	write("other.mp4")
+
+	if _, err := manager.Scan(dir); err != nil {
+		t.Fatal(err)
+	}
+	run(t, manager, ScopePending)
+
+	drop := filepath.Join(dir, "Back In Black.mp4")
+	entries, err := manager.RemoveHistory([]string{drop})
+	if err != nil {
+		t.Fatalf("移除记录失败: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("应当只剩 1 条记录，实际 %d 条: %+v", len(entries), entries)
+	}
+	if entries[0].To != filepath.Join(dir, "Thunderstruck.mp4") {
+		t.Errorf("剩下的应当是没被点名的那条，实际 %q", entries[0].To)
+	}
+
+	// 再读一次：移除必须是**持久**的，不能只在这一份返回值里成立。
+	again, err := manager.History()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].To != entries[0].To {
+		t.Fatalf("重新读记录时被移除的那条又回来了: %+v", again)
+	}
+
+	// 磁盘上的文件一个都不许动 —— 移除的是记录，不是文件。
+	names := listDir(t, dir)
+	for _, want := range []string{"Back In Black.mp4", "Thunderstruck.mp4"} {
+		if !contains(names, want) {
+			t.Errorf("移除记录不该动磁盘上的文件，%s 不见了（实际 %v）", want, names)
+		}
+	}
+}
+
+// TestRemoveHistorySurvivesReplay 移除写在 undo.jsonl 里，换一个 Manager 读也认。
+//
+// 这条防的是「只在内存里删掉」那种实现：界面上看着干净了，重启之后
+// 被移除的记录整批回来 —— 而用户已经据此认为「这些不用管了」。
+func TestRemoveHistorySurvivesReplay(t *testing.T) {
+	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
+		"clip.mp4": matched("Back In Black", "AC/DC"),
+	}}
+	dir, manager, write := newHarness(t, baseConfig(), fake)
+	write("clip.mp4")
+
+	if _, err := manager.Scan(dir); err != nil {
+		t.Fatal(err)
+	}
+	run(t, manager, ScopePending)
+
+	if _, err := manager.RemoveHistory([]string{filepath.Join(dir, "Back In Black.mp4")}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 换一个 Manager 指向同一个 dataDir，等于重启一次。
+	fresh := New(baseConfig(), fake, dir, Callbacks{})
+	entries, err := fresh.History()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("重启之后被移除的记录又回来了: %+v", entries)
+	}
+}
+
+// TestRemoveHistoryTakesTheNewestRecordForTheSameFile 同一个 to 在记录里出现两次时，
+// 移除要拿掉**最新**那条。
+//
+// 什么时候会撞同一个 to：改一次名 → 还原 → 再改一次。于是记录里躺着两条
+// 一模一样（from / to 都相同）的行，只差一个「已还原」标记 ——
+// 一条是历史，一条是用户此刻看得见、还能动手的那条。
+//
+// 而勾选集合里装的是 to（路径），它区分不了这两行，所以后端必须自己挑：
+// 挑错方向的话，用户点「移除所选」，屏幕上那行纹丝不动（被拿掉的是已经灰掉的
+// 历史行），他会以为按钮坏了，然后一直点。
+func TestRemoveHistoryTakesTheNewestRecordForTheSameFile(t *testing.T) {
+	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
+		"clip.mp4": matched("Back In Black", "AC/DC"),
+	}}
+	dir, manager, write := newHarness(t, baseConfig(), fake)
+	write("clip.mp4")
+
+	renamed := filepath.Join(dir, "Back In Black.mp4")
+	for round := 0; round < 2; round++ {
+		if _, err := manager.Scan(dir); err != nil {
+			t.Fatal(err)
+		}
+		run(t, manager, ScopePending)
+		if round == 0 {
+			if _, err := manager.UndoOne(renamed); err != nil {
+				t.Fatalf("第 1 轮还原失败: %v", err)
+			}
+		}
+	}
+
+	before, err := manager.History()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 2 || before[0].To != renamed || before[1].To != renamed {
+		t.Fatalf("这里要造的是「同一个 to 出现两次」，实际 %+v", before)
+	}
+	if before[0].Restored || !before[1].Restored {
+		t.Fatalf("最新那条该是没还原过的、老的那条该是已还原，实际 %+v", before)
+	}
+
+	entries, err := manager.RemoveHistory([]string{renamed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("应当剩 1 条，实际 %d 条: %+v", len(entries), entries)
+	}
+	if !entries[0].Restored {
+		t.Error("拿掉之后剩下的应当是那条**已还原**的历史行；" +
+			"剩下没还原过的那条说明移除挑错了方向 —— " +
+			"用户点完按钮，屏幕上那行还会原样在那儿")
 	}
 }
 

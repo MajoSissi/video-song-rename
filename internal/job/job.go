@@ -121,12 +121,13 @@ type stateEntry struct {
 
 // undoEntry 是 undo.jsonl 里的一行。
 //
-// 两种形态，靠字段区分：
+// 三种形态，靠字段区分：
 //
 //	改名：{"from":"…","to":"…","id":"…","ts":…}
 //	还原：{"restore":"…","ts":…}   —— 这个 to 已经被还原回原名了
+//	移除：{"drop":"…","ts":…}      —— 用户把这条记录从记录页拿掉了
 //
-// 用「追加一行还原记录」而不是「回写/删掉原来那行」，是因为这个文件是纯追加的：
+// 用「追加一行事件」而不是「回写/删掉原来那行」，是因为这个文件是纯追加的：
 // 中途崩溃最多丢掉最后一行，不会把整份记录写坏（用户最不能接受的就是
 // 「改了一堆文件，记录还没了」）。代价是读的时候要按顺序重放一遍。
 type undoEntry struct {
@@ -139,7 +140,12 @@ type undoEntry struct {
 	ID string `json:"id,omitempty"`
 	// Restore 非空表示这是一条还原记录，值是**被还原掉的那个 to**。
 	Restore string `json:"restore,omitempty"`
-	TS      int64  `json:"ts"`
+	// Drop 非空表示这是一条移除记录，值是**被拿掉的那条记录的 to**。
+	//
+	// 和还原一样只记一个路径，不记行号：行号会随筛选、重放、以及后面
+	// 又改了同一个文件而变，拿它当钥匙迟早对不上。
+	Drop string `json:"drop,omitempty"`
+	TS   int64  `json:"ts"`
 }
 
 // Recognizer 是编排层对识别器的全部要求。
@@ -1040,6 +1046,21 @@ func (m *Manager) loadUndo() ([]undoRecord, error) {
 			continue
 		}
 
+		if entry.Drop != "" {
+			// 把这条记录拿掉。从后往前找**最近**一条 to 相同的记录：
+			// 同一个文件被改过不止一次时，用户看到的是最新那条，
+			// 要拿掉的也是它（和上面还原分支的匹配规则一致）。
+			//
+			// 找不到就什么都不做 —— 可能这条已经被拿掉过了。
+			for i := len(records) - 1; i >= 0; i-- {
+				if records[i].To == entry.Drop {
+					records = append(records[:i], records[i+1:]...)
+					break
+				}
+			}
+			continue
+		}
+
 		if entry.Restore != "" {
 			// 盖到最近一条「还没还原过」的同名记录上。
 			// 从后往前找，因为同一个 to 可能被改过不止一次。
@@ -1133,6 +1154,92 @@ func locate(record undoRecord, index identityIndex) (string, string) {
 		return found, "id"
 	}
 	return record.To, "path"
+}
+
+// ResyncQueue 把队列里「文件已经不在记录的那个路径上」的条目对回它此刻的实际位置。
+//
+// **只更新已经在队列里的条目**：不新增、不删除。队列里有什么，是用户用
+// 「添加文件 / 添加文件夹 / 拖入」决定的；刷新动作不该改变这个集合。
+//
+// 为什么需要它：任务跑完之后队列里的 Path 指向**改名后**的名字（rename 会把它
+// 一起改掉，见 finishUnmatched / finishMatched）。用户去记录页还原一下，磁盘上的
+// 文件回到了旧名字，队列里那条就对不上了 —— 界面上留着一个磁盘上并不存在的文件名。
+//
+// 对回的办法和还原用的是同一套：改名记录里存着文件的身份，身份不随改名变化，
+// 所以在同一个目录里按身份找，就能认出「名字换过的那一份」。
+//
+// 以前这件事是让**前端**去 `ScanPath(队列第一个文件的目录)` 做的。那样确实也能把
+// 名字刷对，但 `ScanPath` 是「整目录重扫 + 整表替换」—— 于是「还原一个文件」的
+// 副作用变成了「把这个目录下所有视频都拉进队列」。用户报的就是这个：
+// 拖进来一个文件跑完，去记录页转一圈回来，列表里多出了同目录的其他所有视频。
+func (m *Manager) ResyncQueue() []Item {
+	// 跑的时候队列由 worker 在改，这里再插一手就是两边抢同一份数据。
+	// 直接回当前快照 —— 调用方（前端）本来也只是想重画一遍。
+	if m.IsRunning() {
+		return m.Items()
+	}
+
+	records, err := m.loadUndo()
+	if err != nil {
+		return m.Items()
+	}
+
+	// 「记录里的现名」→「它此刻在哪」。
+	// 一份索引给所有记录复用：它们几乎全在同一个目录里（理由同 History）。
+	index := newIdentityIndex()
+	now := make(map[string]string, len(records))
+	for _, record := range records {
+		current, _ := locate(record, index)
+		if current == "" || current == record.To {
+			continue // 名字没变过
+		}
+		if _, err := os.Stat(current); err == nil {
+			now[record.To] = current
+		}
+	}
+
+	m.mu.Lock()
+	moved := 0
+	for i := range m.items {
+		current, ok := now[m.items[i].Path]
+		if !ok {
+			continue
+		}
+		// 原路径还在，说明那儿另有一份同名文件 —— 这次要动的不是它。
+		// 不挡这一下的话，一个恰好占了旧名字的无关文件会被顶掉。
+		if _, err := os.Stat(m.items[i].Path); err == nil {
+			continue
+		}
+
+		m.items[i].Path = current
+		m.items[i].Dir = filepath.Dir(current)
+		m.items[i].Name = filepath.Base(current)
+		m.items[i].Ext = filepath.Ext(current)
+
+		// 改名的结果作废了：文件已经回到旧名字，界面上再挂着「新文件名」
+		// 和「已改名」就是在说假话。回到「待处理」，想再跑一遍按开始就行。
+		m.items[i].Status = StatusPending
+		m.items[i].NewName = ""
+		m.items[i].NewPath = ""
+		m.items[i].Message = ""
+		m.items[i].Attempts = 0
+		moved++
+	}
+	if moved > 0 {
+		m.recountLocked()
+	}
+	snapshot := make([]Item, len(m.items))
+	copy(snapshot, m.items)
+	progress := m.progress
+	m.mu.Unlock()
+
+	if moved > 0 {
+		m.logf("INFO", "队列已跟随磁盘更新 %d 条", moved)
+		if m.callbacks.OnProgress != nil {
+			m.callbacks.OnProgress(progress)
+		}
+	}
+	return snapshot
 }
 
 // restoreOne 把一个文件从它现在的位置改回 record.From，并补一条还原记录。
@@ -1466,6 +1573,35 @@ func (m *Manager) History() ([]HistoryEntry, error) {
 		entries[left], entries[right] = entries[right], entries[left]
 	}
 	return entries, nil
+}
+
+// RemoveHistory 把指定的记录从记录页拿掉，返回拿掉之后的记录列表。
+//
+// targets 是每条记录**现名**的完整路径 —— 界面上勾的就是这个
+// （前端 historyPicked 里装的也是它）。
+//
+// **不碰磁盘**：拿掉的只是「这个文件原来叫什么」这条备忘，文件本身、
+// 以及它现在叫什么，都不动。代价是拿掉之后再也还原不回原名了 ——
+// 所以界面上那颗按钮带确认，而且文案里要把这句写出来。
+//
+// 实现是往 undo.jsonl **追加**一行 {"drop":"…"}，让 loadUndo 重放时跳过它。
+// 不重写整个文件：那个文件是纯追加的，崩溃最多丢最后一行；回写则一次能写坏
+// 全份，而这份记录恰恰是「改了一堆文件之后唯一的后悔药」。
+func (m *Manager) RemoveHistory(targets []string) ([]HistoryEntry, error) {
+	now := time.Now().UnixMilli()
+	removed := 0
+	for _, to := range targets {
+		if to == "" {
+			continue
+		}
+		m.appendUndo(undoEntry{Drop: to, TS: now})
+		removed++
+	}
+	if removed > 0 {
+		// 写进日志文件。这是一次**丢后悔药**的操作，事后要能查出来是哪天做的。
+		m.logf("INFO", "从记录里移除 %d 条（磁盘上的文件不受影响）", removed)
+	}
+	return m.History()
 }
 
 // Remove 把指定下标的条目从列表里拿掉，返回新列表。

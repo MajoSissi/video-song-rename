@@ -62,7 +62,8 @@
 
 # AI 协作的本地痕迹：memory/ 里的工作日志，加上 capture.ps1、ps-out.txt、
 # shot-*.png 这些临时文件。属于本地留档，正式文档以 README.md / DEVELOP.md 为准。
-/.workbuddy-ai/
+.workbuddy-ai/
+.workbuddy/
 
 # ---------------------------------------------------------------- 杂项
 

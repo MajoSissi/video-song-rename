@@ -495,10 +495,17 @@ func (t *winTray) applyIcon() {
 		procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(data)))
 		procDestroyIcon.Call(uintptr(previous))
 	}
-
-	// 把这行写进日志：DPI 感知没生效时图标会糊，而「实际用了哪一档」
-	// 是唯一能证明它生效了的客观信号。
-	t.logf("托盘图标已就绪：%d×%d（系统要求 %d×%d）", frame.Width, frame.Height, want, want)
+	// 成功不写日志。
+	//
+	// 这里本来有一句「托盘图标已就绪：24×24（系统要求 24×24）」。它的用意是留个
+	// 客观信号——DPI 感知没声明时图标会糊，而「实际挑了哪一档」是唯一能证明它
+	// 生效过的证据。但代价是每台机器每次启动都往用户的日志面板里塞一行看不懂的
+	// 数字，而它**从不指示任何需要用户动手的事**：糊了就糊了，用户也没法从这行
+	// 数字里得出什么结论。
+	//
+	// 「挑对档位」这件事已经由 tray_windows_test.go 的 pickICO 断言和
+	// tray_live_test.go 的冒烟测试（要求 applyIcon 一条日志都不产生）钉住了，
+	// 不需要在生产路径上留痕。
 }
 
 func (t *winTray) showBalloon() {
