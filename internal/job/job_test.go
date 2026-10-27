@@ -9,8 +9,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"videosongrename/internal/config"
+	"videosongrename/internal/naming"
+	"videosongrename/internal/pace"
 	"videosongrename/internal/recognizer"
 )
 
@@ -19,12 +22,14 @@ type fakeRecognizer struct {
 	mu      sync.Mutex
 	byName  map[string]recognizer.Result
 	calls   int
+	times   []time.Time
 	lastCfg recognizer.Options
 }
 
 func (f *fakeRecognizer) Recognize(_ context.Context, opts recognizer.Options) (recognizer.Result, error) {
 	f.mu.Lock()
 	f.calls++
+	f.times = append(f.times, time.Now())
 	f.lastCfg = opts
 	result := f.byName[filepath.Base(opts.Path)]
 	f.mu.Unlock()
@@ -41,6 +46,22 @@ func (f *fakeRecognizer) callCount() int {
 	return f.calls
 }
 
+// callTimes 返回每次调用发生的时刻，用来验证节流真的隔开了请求。
+func (f *fakeRecognizer) callTimes() []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]time.Time, len(f.times))
+	copy(out, f.times)
+	return out
+}
+
+// setResult 在跑到一半之后改某个文件的结果（模拟「限流解除后再跑一次」）。
+func (f *fakeRecognizer) setResult(name string, result recognizer.Result) {
+	f.mu.Lock()
+	f.byName[name] = result
+	f.mu.Unlock()
+}
+
 func matched(title, artist string) recognizer.Result {
 	return recognizer.Result{OK: true, Status: recognizer.StatusMatched, Title: title, Artist: artist}
 }
@@ -51,6 +72,13 @@ func newHarness(t *testing.T, cfg config.Config, fake *fakeRecognizer) (string, 
 
 	dir := t.TempDir()
 	manager := New(cfg, fake, dir, Callbacks{})
+	// 把闸门换成一个「几乎不隔时长」的版本。
+	//
+	// 真实默认值是 1.5 秒一次请求，一条用例跑三个文件就要白等 4.5 秒 ——
+	// 整套测试会从几秒涨到几分钟，而这里没有任何一条用例在验证默认值。
+	// 节奏本身由 internal/pace 的测试负责，冷却行为由 ratelimit_test.go
+	// 用一个同样很短的基数来验证。连线（配置里的间隔真的进了闸门）另有一条用例。
+	manager.gate = pace.NewGate(0, 10*time.Millisecond, 20*time.Millisecond)
 
 	write := func(name string) {
 		t.Helper()
@@ -66,6 +94,8 @@ func baseConfig() config.Config {
 	cfg.SkipProcessed = false
 	cfg.Concurrency = 1
 	cfg.Retries = 0
+	// 归一化下限就是 300 毫秒；这里给个合法值，免得被 Normalize 换成默认的 1.5 秒。
+	cfg.RequestIntervalMS = 300
 	return cfg
 }
 
@@ -73,7 +103,16 @@ func run(t *testing.T, manager *Manager, scope Scope) Summary {
 	t.Helper()
 
 	var summary Summary
-	manager.callbacks = Callbacks{OnDone: func(s Summary) { summary = s }}
+	// 只替换 OnDone，其余钩子原样留着 —— 用例经常先装一个进度/条目记录器，
+	// 这里整个覆盖掉的话，那些记录器会静默失效（踩过：冷却提示的用例
+	// 一直读不到进度事件）。
+	previous := manager.callbacks
+	manager.callbacks = Callbacks{
+		OnItem:     previous.OnItem,
+		OnProgress: previous.OnProgress,
+		OnLog:      previous.OnLog,
+		OnDone:     func(s Summary) { summary = s },
+	}
 
 	if err := manager.Start(context.Background(), scope); err != nil {
 		t.Fatalf("Start 失败: %v", err)
@@ -308,18 +347,18 @@ func TestDryRunPreviewShowsSuffixedName(t *testing.T) {
 	}
 }
 
-// TestTemplateDecidesWhichLocalesGetQueried 钉住「模板 → 额外语种 → 识别器」这条链。
+// TestNamingRuleDecidesWhichLocalesGetQueried 钉住「命名规则 → 额外语种 → 识别器」这条链。
 //
 // 额外语种现在是**派生值**，不再是设置项：以前要用户自己在设置页手填一份
-// ko-KR/KR，忘了填的后果是模板里那一格永远是空的，而界面上看不出任何异常。
+// ko-KR/KR，忘了填的后果是规则里那一格永远是空的，而界面上看不出任何异常。
 // 两个包各自单测都过、拼起来却没接上，正是这种派生关系最典型的失败方式。
-func TestTemplateDecidesWhichLocalesGetQueried(t *testing.T) {
+func TestNamingRuleDecidesWhichLocalesGetQueried(t *testing.T) {
 	fake := &fakeRecognizer{byName: map[string]recognizer.Result{
 		"clip.mp4": matched("Back In Black", "AC/DC"),
 	}}
 	cfg := baseConfig()
-	// 这份内置模板同时用到英文名和中文名，所以两套 storefront 都该被查。
-	cfg.ActiveTemplate = "艺人 - 英文名 - 中文名"
+	// 这份规则同时用到英文名和中文名，所以两套 storefront 都该被查。
+	cfg.NameTemplate = naming.ParseBody("{artist} - {title:en} - {title:zh}")
 	cfg.Normalize()
 
 	dir, manager, write := newHarness(t, cfg, fake)

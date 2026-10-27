@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"videosongrename/internal/media"
 	"videosongrename/internal/naming"
 )
 
@@ -28,63 +29,109 @@ const (
 // TitlePreference 是标题脚本的优先级。命中靠前的优先用。
 var TitlePreference = []string{"english", "chinese", "korean", "japanese", "other"}
 
-// Template 是命名模板库里的一项。
+// DefaultNameTemplate 是没有任何配置时的命名规则。
 //
-// 内嵌 naming.Template（分隔符 + 槽位），所以 JSON 里是
-// {"name":…, "separator":…, "slots":[…]},没有额外一层嵌套。
-type Template struct {
-	// Name 是给人看的名字，也是这一项的标识——重名即视为「改这一项」。
+// 只写歌名是刻意的：第一次用的人多半只想把文件名从「VID_20240103」换成
+// 真正的歌名；艺人那一格等他确认识别确实准了，自己在「命名」页加上就行。
+func DefaultNameTemplate() naming.Template {
+	return naming.ParseBody("{title}")
+}
+
+// 移动模式。
+const (
+	// MoveModeSibling 在文件所在目录的**同级**建一个目录，名字默认与上级目录同名。
+	//
+	//	D:\视频\2024\a.mp4 → D:\视频\2024_已整理\a.mp4
+	MoveModeSibling = "sibling"
+	// MoveModeFixed 统一挪进一个固定目录。
+	MoveModeFixed = "fixed"
+)
+
+// MoveRule 决定「处理成功的文件最后放在哪儿」。
+//
+// 为什么不是简单的「一个目标目录」：按日期或按批次建的目录结构里，
+// 用户要的往往是「在这一层旁边再开一个收纳目录」，也就是模式 sibling。
+// 每次都要手填一个绝对路径的话，一次处理十个不同文件夹就得填十遍。
+type MoveRule struct {
+	Enabled bool `json:"enabled"`
+	// Mode 取 MoveMode*。留空按 sibling 处理。
+	Mode string `json:"mode"`
+	// Dir 是 fixed 模式的目标目录。相对路径按「文件所在目录」解析，
+	// 这样「整理到同目录下的 sorted」也能写。
+	Dir string `json:"dir"`
+	// Name 非空时，sibling 模式用它代替上级目录名。
 	Name string `json:"name"`
-	naming.Template
+	// Prefix / Suffix 拼在目录名两侧，只对 sibling 模式生效。
+	Prefix string `json:"prefix"`
+	Suffix string `json:"suffix"`
+	// MatchedOnly 为真时只移动识别成功的文件，未识别的留在原目录。
+	//
+	// 默认就是真：没识别出来的那些多半还要人工处理，把它们一起扫进归档目录，
+	// 等于让用户去归档目录里找「哪些是失败的」——那正是这个功能想省掉的事。
+	MatchedOnly bool `json:"matched_only"`
 }
 
-// UnmarshalJSON 兼容两种历史形状：
-//
-//	新：{"name":"…","separator":" - ","slots":[…]}
-//	旧：{"name":"…","body":"{artist} - {title}"}
-//
-// 旧的 body 字符串直接迁移成槽位。不这么做的话，老配置里的 body 会被当成
-// 未知键悄悄丢掉，模板变成空的，再被 Normalize 清理掉——用户升级后发现
-// 自己攒的模板全没了，而且全程没有任何报错。
-func (t *Template) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Name      string        `json:"name"`
-		Body      string        `json:"body"`
-		Separator string        `json:"separator"`
-		Slots     []naming.Slot `json:"slots"`
+// FolderName 返回 sibling 模式下那个目录的名字（还没拼上级路径）。
+// 返回空串表示「定不出一个合法的名字」，调用方应当认为不移动。
+func (r MoveRule) FolderName(filePath string) string {
+	base := strings.TrimSpace(r.Name)
+	if base == "" {
+		parent := filepath.Dir(filePath)
+		base = filepath.Base(parent)
+		// 文件直接放在盘符根目录（D:\x.mp4）时 Base 给回来的是 "\"，
+		// 拿它当目录名会拼出一个叫「_」的目录。这种情况只能靠自定义名。
+		if base == "" || base == "." || base == `\` || base == "/" ||
+			base == string(filepath.Separator) {
+			return ""
+		}
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	name := strings.TrimSpace(r.Prefix + base + r.Suffix)
+	if name == "" {
+		return ""
 	}
-
-	t.Name = raw.Name
-	if len(raw.Slots) > 0 {
-		t.Template = naming.Template{Separator: raw.Separator, Slots: raw.Slots}
-		return nil
-	}
-	t.Template = naming.ParseBody(raw.Body)
-	return nil
+	return media.SanitizeName(name, 80)
 }
 
-// BuiltinTemplates 返回内置模板。它们和用户自己加的一样可以被改、被删。
-//
-// 这里刻意用 ParseBody 从字符串构造，而不是手写 Slot 字面量：
-// 内置模板本来就是「示例」，写成用户熟悉的模板串更看得出它长什么样，
-// 顺带也把迁移路径本身跑了一遍。
-func BuiltinTemplates() []Template {
-	builtin := func(name, body string) Template {
-		return Template{Name: name, Template: naming.ParseBody(body)}
+// TargetDir 算出这个文件处理完之后该放进哪个目录。空串表示「不移动」。
+func (r MoveRule) TargetDir(filePath string) string {
+	if !r.Enabled {
+		return ""
 	}
-	return []Template{
-		builtin("只歌名", "{title}"),
-		builtin("歌名 - 艺人", "{title} - {artist}"),
-		builtin("艺人 - 歌名", "{artist} - {title}"),
-		builtin("歌名 (年份)", "{title} ({year})"),
-		builtin("艺人 - 歌名 (年份)", "{artist} - {title} ({year})"),
-		builtin("保持原文件名", "{original}"),
-		// 中文用户最常见的一种：艺人 + 英文名 + 中文名。
-		// 中文没识别到时，那一格连同分隔符一起消失，不会留下尾部的横杠。
-		builtin("艺人 - 英文名 - 中文名", "{artist} - {title:en} - {title:zh}"),
+
+	if r.Mode == MoveModeFixed {
+		dir := strings.TrimSpace(r.Dir)
+		if dir == "" {
+			return ""
+		}
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(filepath.Dir(filePath), dir)
+		}
+		return filepath.Clean(dir)
+	}
+
+	folder := r.FolderName(filePath)
+	if folder == "" {
+		return ""
+	}
+	parent := filepath.Dir(filePath)
+	// 「同级同名称」：目录的爸爸和文件的爸爸是同一个。
+	return filepath.Join(filepath.Dir(parent), folder)
+}
+
+// Normalize 把移动规则收敛到合法取值。
+//
+// 不因为「参数不全」就把 Enabled 关掉：那样用户勾了开关、填了一半、
+// 点保存，回来发现开关自己弹回去了，而且不知道是哪一项不合格。
+// 定不出目标目录时由任务层如实报「跳过移动」并写进日志。
+func (r *MoveRule) Normalize() {
+	r.Dir = strings.TrimSpace(r.Dir)
+	r.Name = strings.TrimSpace(r.Name)
+	r.Prefix = strings.TrimSpace(r.Prefix)
+	r.Suffix = strings.TrimSpace(r.Suffix)
+	switch r.Mode {
+	case MoveModeFixed, MoveModeSibling:
+	default:
+		r.Mode = MoveModeSibling
 	}
 }
 
@@ -96,24 +143,25 @@ type Config struct {
 	Concurrency int `json:"concurrency"`
 	// Retries 是单个文件在「可重试错误」下的重试次数。
 	Retries int `json:"retries"`
+	// RequestIntervalMS 是两次 Shazam 请求之间的最小间隔（毫秒）。
+	//
+	// 决定会不会被限流的是**间隔**，不是并发数：并发 3 意味着三个 worker
+	// 可能在同一秒里各发一次请求，服务端看到的就是一次三连突发。
+	// 并发只影响「解码和等待能重叠几份」，发请求的节奏统一由这个间隔管。
+	RequestIntervalMS int `json:"request_interval_ms"`
 	// Language 是请求的 Accept-Language。
 	Language string `json:"language"`
 	// Country 是接口国家代码。
 	Country string `json:"country"`
 	// TimeoutSeconds 是单次识别请求的超时。
 	TimeoutSeconds int `json:"timeout_seconds"`
-	// NameTemplate 是当前生效的命名规则。
-	//
-	// 它由 Templates 里 ActiveTemplate 那一项派生出来，界面不该直接改它——
-	// 保留这个字段是为了让 job 层不必认识「模板库」这个概念。
+	// NameTemplate 是**唯一**的命名规则，全局生效。
 	//
 	// 类型是结构化的（分隔符 + 槽位），不再是模板字符串。JSON 的键没变，
 	// 因为 naming.Template 自己认得出旧格式的字符串。
 	NameTemplate naming.Template `json:"name_template"`
-	// Templates 是可增删的模板库。
-	Templates []Template `json:"templates"`
-	// ActiveTemplate 是当前选中的模板名。
-	ActiveTemplate string `json:"active_template"`
+	// Move 决定处理成功的文件最后放在哪儿。见 MoveRule。
+	Move MoveRule `json:"move"`
 	// UnmatchedPrefix 是未识别文件的前缀，默认 "0_"。
 	UnmatchedPrefix string `json:"unmatched_prefix"`
 	// UnmatchedSuffix 是未识别文件的后缀，默认空。
@@ -160,16 +208,16 @@ type Config struct {
 	CloseToTray bool `json:"close_to_tray"`
 }
 
-// ExtraLocales 返回当前命名模板还需要额外查询的「语言/国家」组合。
+// ExtraLocales 返回命名规则还需要额外查询的「语言/国家」组合。
 //
-// 这**不是**一个配置项，而是从模板推导出来的，所以这里没有对应的字段。
-// 理由见 naming.ExtraLocales 的注释：模板里用了哪个语种和要查哪些 storefront
+// 这**不是**一个配置项，而是从规则推导出来的，所以这里没有对应的字段。
+// 理由见 naming.ExtraLocales 的注释：规则里用了哪个语种和要查哪些 storefront
 // 本来就是同一件事，拆成两处设只会让人漏填，而漏填是静默失效。
 //
 // 旧配置里的 title_locales 键会被忽略（json.Unmarshal 不认未知字段不会报错），
 // 下次保存就自然消失了，不需要写迁移代码。
 func (c Config) ExtraLocales() []string {
-	return naming.ExtraLocales(TemplateSpec(c.Templates, c.ActiveTemplate))
+	return naming.ExtraLocales(c.NameTemplate)
 }
 
 // UnmatchedNaming 返回未识别文件的前后缀。
@@ -179,17 +227,21 @@ func (c Config) UnmatchedNaming() naming.Unmatched {
 
 // Default 返回一份默认设置。
 func Default() Config {
-	templates := BuiltinTemplates()
 	return Config{
-		SegmentSeconds:  12,
-		Concurrency:     3,
-		Retries:         2,
-		Language:        "en-US",
-		Country:         "GB",
-		TimeoutSeconds:  20,
-		NameTemplate:    templates[0].Template,
-		Templates:       templates,
-		ActiveTemplate:  templates[0].Name,
+		SegmentSeconds: 12,
+		Concurrency:    3,
+		Retries:        2,
+		// 1.5 秒一次 = 每分钟 40 次。这是一条经验上的安全线：再快一点，
+		// 队列一长就很容易在中途吃到 429，而吃到之后的冷却远比这点节流贵。
+		RequestIntervalMS: 1500,
+		Language:          "en-US",
+		Country:           "GB",
+		TimeoutSeconds:    20,
+		NameTemplate:      DefaultNameTemplate(),
+		Move: MoveRule{
+			Mode:        MoveModeSibling,
+			MatchedOnly: true,
+		},
 		UnmatchedPrefix: "0_",
 		Extensions: []string{
 			".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".ts",
@@ -228,6 +280,18 @@ func (c *Config) Normalize() {
 	if c.Retries > 10 {
 		c.Retries = 10
 	}
+	// 请求间隔不给「关掉」这个选项：0 和负数一律当没填，回到默认值。
+	// 「把节流关了」在界面上看着像性能优化，实际是把 429 的开关打开。
+	if c.RequestIntervalMS <= 0 {
+		c.RequestIntervalMS = def.RequestIntervalMS
+	}
+	if c.RequestIntervalMS < 300 {
+		c.RequestIntervalMS = 300
+	}
+	// 上限 10 秒：再慢的话一百首的队列要跑二十分钟，用户会以为程序卡死了。
+	if c.RequestIntervalMS > 10000 {
+		c.RequestIntervalMS = 10000
+	}
 	if c.TimeoutSeconds < 5 {
 		c.TimeoutSeconds = 5
 	}
@@ -250,7 +314,7 @@ func (c *Config) Normalize() {
 		c.TitlePreference = def.TitlePreference
 	}
 
-	normalizeTemplates(c, def)
+	normalizeNaming(c, def)
 
 	c.FFmpegPath = strings.TrimSpace(c.FFmpegPath)
 	c.Proxy = strings.TrimSpace(c.Proxy)
@@ -278,70 +342,17 @@ func (c *Config) Normalize() {
 	c.Extensions = cleaned
 }
 
-// normalizeTemplates 把模板库收敛成一份自洽的状态。
+// normalizeNaming 把命名规则收敛到一份可用的状态。
 //
-// 三条不变量：库不为空、ActiveTemplate 指向库里真实存在的一项、NameTemplate 永远
-// 等于当前选中项。最后一条是刻意的冗余——job 层只认 NameTemplate，
-// 不该让它也去理解「模板库」这个概念。
-func normalizeTemplates(c *Config, def Config) {
-	seen := make(map[string]bool, len(c.Templates))
-	cleaned := make([]Template, 0, len(c.Templates))
-	for _, tpl := range c.Templates {
-		name := strings.TrimSpace(tpl.Name)
-		if name == "" || seen[name] {
-			continue
-		}
-		tpl.Name = name
-		tpl.Template.Normalize()
-		// 一个槽位都不剩的模板直接丢掉。界面上也不允许存出这种模板
-		// （SaveTemplate 会报错），但配置文件是可以手改的。
-		if tpl.Template.IsZero() {
-			continue
-		}
-		seen[name] = true
-		cleaned = append(cleaned, tpl)
+// 规则只有两份，边界也只有两条：空规则退回默认，移动规则本身自洁。
+// 「一个槽位都不剩」必须当成空规则处理 —— 否则渲染会得到空名字，
+// naming.Apply 再退回原文件名，界面上看不出任何异常，只是所有名字都没变。
+func normalizeNaming(c *Config, def Config) {
+	c.NameTemplate.Normalize()
+	if c.NameTemplate.IsZero() {
+		c.NameTemplate = def.NameTemplate
 	}
-	c.Templates = cleaned
-
-	// 全删光时铺回内置的，免得界面上出现一个空模板库。
-	if len(c.Templates) == 0 {
-		c.Templates = append([]Template(nil), def.Templates...)
-	}
-
-	if !HasTemplate(c.Templates, c.ActiveTemplate) {
-		c.ActiveTemplate = c.Templates[0].Name
-	}
-	c.NameTemplate = TemplateSpec(c.Templates, c.ActiveTemplate)
-}
-
-// HasTemplate 报告模板库里有没有叫这个名字的一项。
-func HasTemplate(list []Template, name string) bool {
-	for _, tpl := range list {
-		if tpl.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// TemplateSpec 取某个模板的渲染规则，没有就返回空模板。
-func TemplateSpec(list []Template, name string) naming.Template {
-	for _, tpl := range list {
-		if tpl.Name == name {
-			return tpl.Template
-		}
-	}
-	return naming.Template{}
-}
-
-// templateByName 按渲染规则反查名字，用来判断一份旧配置的模板是不是内置的那几种。
-func templateByName(list []Template, spec naming.Template) string {
-	for _, tpl := range list {
-		if tpl.Template.Equal(spec) {
-			return tpl.Name
-		}
-	}
-	return ""
+	c.Move.Normalize()
 }
 
 // DataDirName 是程序旁边放数据的目录名。
@@ -400,30 +411,68 @@ func Load(dir string) (Config, error) {
 		return Default(), fmt.Errorf("解析配置失败（已回退默认值）: %w", err)
 	}
 
-	// 旧版本只有一个 name_template，没有模板库。
+	// 旧配置是「模板库 + 当前选中」，现在只留一份全局规则。
 	//
-	// Default() 已经把模板库填成了内置的那几份，所以「JSON 里到底有没有 templates
-	// 这个键」是唯一能区分新旧配置的信号。只看结构体是不是空的会被 Default 骗过去，
-	// 结果是用户自己改过的模板被内置值静默顶掉——这种丢配置的 bug 不会有任何报错。
+	// 迁移要挑出用户**实际在用**的那一份：先看 active_template 指向哪一项，
+	// 没有就取第一项。挑错的后果是升级之后命名规则悄悄变了 ——
+	// 下一次跑任务，文件名和上一批不是同一种形状，而没有任何报错。
 	//
-	// name_template 的解析交给 naming.Template.UnmarshalJSON：它认得出旧格式
-	// 的字符串，读进来就已经是槽位了。
-	if !hasJSONKey(raw, "templates") {
-		cfg.Templates = BuiltinTemplates()
-		cfg.ActiveTemplate = ""
-		legacy := cfg.NameTemplate
-		if !legacy.IsZero() {
-			if name := templateByName(cfg.Templates, legacy); name != "" {
-				cfg.ActiveTemplate = name
-			} else {
-				cfg.Templates = append(cfg.Templates, Template{Name: "自定义", Template: legacy})
-				cfg.ActiveTemplate = "自定义"
-			}
-		}
+	// name_template 本身的解析交给 naming.Template.UnmarshalJSON：
+	// 它认得出旧格式的字符串，读进来就已经是槽位了。
+	if spec, ok := migratedTemplate(raw); ok {
+		cfg.NameTemplate = spec
 	}
 
 	cfg.Normalize()
 	return cfg, nil
+}
+
+// migratedTemplate 从旧配置的模板库里挑出「当时在用的那一份」。
+//
+// 只在文件里真的有 templates 键时才动：新配置没有这个键，返回 ok=false，
+// 调用方就保留 name_template 原值，不会被默认值顶掉。
+func migratedTemplate(raw []byte) (naming.Template, bool) {
+	if !hasJSONKey(raw, "templates") {
+		return naming.Template{}, false
+	}
+
+	var legacy struct {
+		Templates []struct {
+			Name      string        `json:"name"`
+			Body      string        `json:"body"`
+			Separator string        `json:"separator"`
+			Slots     []naming.Slot `json:"slots"`
+		} `json:"templates"`
+		Active string `json:"active_template"`
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return naming.Template{}, false
+	}
+
+	spec := func(item struct {
+		Name      string        `json:"name"`
+		Body      string        `json:"body"`
+		Separator string        `json:"separator"`
+		Slots     []naming.Slot `json:"slots"`
+	}) naming.Template {
+		if len(item.Slots) > 0 {
+			return naming.Template{Separator: item.Separator, Slots: item.Slots}
+		}
+		return naming.ParseBody(item.Body)
+	}
+
+	// 先把选中项捞出来，再退回第一项。
+	for _, item := range legacy.Templates {
+		if item.Name == legacy.Active {
+			return spec(item), true
+		}
+	}
+	for _, item := range legacy.Templates {
+		if candidate := spec(item); !candidate.IsZero() {
+			return candidate, true
+		}
+	}
+	return naming.Template{}, false
 }
 
 // hasJSONKey 判断原始 JSON 里有没有某个顶层键。用来区分「字段不存在」和「字段是零值」。

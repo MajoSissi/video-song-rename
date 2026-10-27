@@ -43,8 +43,9 @@ pub struct Track {
 /// 一次识别请求的失败原因。Go 侧靠这个分类决定要不要重试。
 #[derive(Debug)]
 pub enum LookupError {
-    /// 429。必须退避，重试越快越糟。
-    RateLimited,
+    /// 429。必须退避，重试越快越糟。带的是应答里 `Retry-After` 的值（秒），
+    /// 没有这个头就是 None —— 实测它经常没有，所以不能指望。
+    RateLimited(Option<u64>),
     /// 连接超时、DNS、TLS 等网络层问题。可重试。
     Network(String),
     /// 5xx 或无法解析的应答。可重试。
@@ -56,7 +57,10 @@ pub enum LookupError {
 impl std::fmt::Display for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LookupError::RateLimited => write!(f, "Shazam 限流（HTTP 429）"),
+            LookupError::RateLimited(None) => write!(f, "Shazam 限流（HTTP 429）"),
+            LookupError::RateLimited(Some(seconds)) => {
+                write!(f, "Shazam 限流（HTTP 429，Retry-After {seconds} 秒）")
+            }
             LookupError::Network(msg) => write!(f, "网络错误: {msg}"),
             LookupError::Upstream(msg) => write!(f, "Shazam 应答异常: {msg}"),
             LookupError::Rejected(msg) => write!(f, "Shazam 拒绝了请求: {msg}"),
@@ -68,7 +72,7 @@ impl LookupError {
     /// 供 Go 侧判断是否重试。
     pub fn kind(&self) -> &'static str {
         match self {
-            LookupError::RateLimited => "rate_limited",
+            LookupError::RateLimited(_) => "rate_limited",
             LookupError::Network(_) => "network",
             LookupError::Upstream(_) => "upstream",
             LookupError::Rejected(_) => "rejected",
@@ -78,8 +82,16 @@ impl LookupError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            LookupError::RateLimited | LookupError::Network(_) | LookupError::Upstream(_)
+            LookupError::RateLimited(_) | LookupError::Network(_) | LookupError::Upstream(_)
         )
+    }
+
+    /// 429 应答里的 `Retry-After`（秒）。不是限流错误就返回 None。
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            LookupError::RateLimited(seconds) => *seconds,
+            _ => None,
+        }
     }
 }
 
@@ -184,7 +196,15 @@ pub async fn lookup(
 
     let status = response.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return Err(LookupError::RateLimited);
+        // 有 `Retry-After` 就带上：Go 侧会拿它当冷却时长（有上限）。
+        // 这个头也可能是 HTTP-date 形式，那种解析不了 —— 报 None，让 Go 侧
+        // 用自己的退避曲线，别在这边猜。
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        return Err(LookupError::RateLimited(retry_after));
     }
 
     let text = response

@@ -153,11 +153,11 @@ type reloc struct {
 // ------------------------------------------------------------------ 序列化
 
 func (d *resDir) write(buf []byte) {
-	binary.LittleEndian.PutUint32(buf[d.offset:], 0)                    // Characteristics
-	binary.LittleEndian.PutUint32(buf[d.offset+4:], 0)                  // TimeDateStamp
-	binary.LittleEndian.PutUint16(buf[d.offset+8:], 0)                  // MajorVersion
-	binary.LittleEndian.PutUint16(buf[d.offset+10:], 0)                 // MinorVersion
-	binary.LittleEndian.PutUint16(buf[d.offset+12:], 0)                 // NumberOfNamedEntries
+	binary.LittleEndian.PutUint32(buf[d.offset:], 0)    // Characteristics
+	binary.LittleEndian.PutUint32(buf[d.offset+4:], 0)  // TimeDateStamp
+	binary.LittleEndian.PutUint16(buf[d.offset+8:], 0)  // MajorVersion
+	binary.LittleEndian.PutUint16(buf[d.offset+10:], 0) // MinorVersion
+	binary.LittleEndian.PutUint16(buf[d.offset+12:], 0) // NumberOfNamedEntries
 	binary.LittleEndian.PutUint16(buf[d.offset+14:], uint16(len(d.entries)))
 
 	for index, entry := range d.entries {
@@ -200,11 +200,11 @@ func (d *resDir) write(buf []byte) {
 
 func writeCOFF(path string, section []byte, relocs []reloc) error {
 	const (
-		headerSize    = 20
-		sectionHdr    = 40
-		relocSize     = 10
-		symbolSize    = 18
-		stringTable   = 4
+		headerSize  = 20
+		sectionHdr  = 40
+		relocSize   = 10
+		symbolSize  = 18
+		stringTable = 4
 	)
 
 	relocTableAt := headerSize + sectionHdr + len(section)
@@ -325,8 +325,8 @@ func buildGroupIcon(frames []icoFrame) []byte {
 		}
 		out[at] = dimension(frame.width)
 		out[at+1] = dimension(frame.height)
-		out[at+2] = 0 // 调色板颜色数
-		out[at+3] = 0 // 保留
+		out[at+2] = 0                                // 调色板颜色数
+		out[at+3] = 0                                // 保留
 		binary.LittleEndian.PutUint16(out[at+4:], 1) // 色彩平面
 		binary.LittleEndian.PutUint16(out[at+6:], frame.bits)
 		binary.LittleEndian.PutUint32(out[at+8:], uint32(len(frame.blob)))
@@ -388,13 +388,13 @@ func buildVersionInfo(major, minor, patch, build int) []byte {
 	binary.LittleEndian.PutUint32(fixed[12:], uint32(patch)<<16|uint32(build))
 	binary.LittleEndian.PutUint32(fixed[16:], uint32(major)<<16|uint32(minor))
 	binary.LittleEndian.PutUint32(fixed[20:], uint32(patch)<<16|uint32(build))
-	binary.LittleEndian.PutUint32(fixed[24:], 0x3F)          // FileFlagsMask
-	binary.LittleEndian.PutUint32(fixed[28:], 0)             // FileFlags
-	binary.LittleEndian.PutUint32(fixed[32:], 0x00040004)    // FileOS = VOS_NT_WINDOWS32
-	binary.LittleEndian.PutUint32(fixed[36:], 1)             // FileType = VFT_APP
-	binary.LittleEndian.PutUint32(fixed[40:], 0)             // FileSubtype
-	binary.LittleEndian.PutUint32(fixed[44:], 0)             // FileDateMS
-	binary.LittleEndian.PutUint32(fixed[48:], 0)             // FileDateLS
+	binary.LittleEndian.PutUint32(fixed[24:], 0x3F)       // FileFlagsMask
+	binary.LittleEndian.PutUint32(fixed[28:], 0)          // FileFlags
+	binary.LittleEndian.PutUint32(fixed[32:], 0x00040004) // FileOS = VOS_NT_WINDOWS32
+	binary.LittleEndian.PutUint32(fixed[36:], 1)          // FileType = VFT_APP
+	binary.LittleEndian.PutUint32(fixed[40:], 0)          // FileSubtype
+	binary.LittleEndian.PutUint32(fixed[44:], 0)          // FileDateMS
+	binary.LittleEndian.PutUint32(fixed[48:], 0)          // FileDateLS
 
 	text := fmt.Sprintf("%d.%d.%d.%d", major, minor, patch, build)
 

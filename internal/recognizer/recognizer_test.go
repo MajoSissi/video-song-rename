@@ -81,3 +81,20 @@ func TestCommandLineShowsProxy(t *testing.T) {
 		t.Fatalf("命令预览里看不到代理: %s", line)
 	}
 }
+
+// TestBuildArgsPassesMinInterval 守住「文件内部那几次请求的间隔」。
+//
+// 编排层只能节流文件之间；一个文件配了三个额外语种就是四次请求，
+// 那四次由 sidecar 按 --min-interval 自己隔开。这个参数漏传的话，
+// 界面上把间隔调到 5 秒也没用——文件内部依然是零间隔齐射。
+func TestBuildArgsPassesMinInterval(t *testing.T) {
+	args := buildArgs(Options{Path: "a.mp4", RequestIntervalMS: 1500})
+	if !hasFlagValue(args, "--min-interval", "1500") {
+		t.Fatalf("请求间隔没有传给 sidecar，实际: %v", args)
+	}
+
+	// 0 表示「不指定」，不该出现在命令行里：sidecar 的默认值是它自己的事。
+	if hasFlag(buildArgs(Options{Path: "a.mp4"}), "--min-interval") {
+		t.Error("间隔为 0 时不该传 --min-interval")
+	}
+}

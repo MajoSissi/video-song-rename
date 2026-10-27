@@ -31,7 +31,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SRC = ROOT / "frontend" / "index.html"
 OUT = pathlib.Path(__file__).resolve().parent / "index.html"
-OPTIONS = pathlib.Path(__file__).resolve().parent / "template-options.json"
+OPTIONS = pathlib.Path(__file__).resolve().parent / "naming-options.json"
 
 html = SRC.read_text(encoding="utf-8")
 
@@ -39,7 +39,7 @@ html = SRC.read_text(encoding="utf-8")
 # 这份 JSON 是两个静态桩共用的副本（另一个是 tools/shoot_ui.py），
 # frontend_contract_test.go 会逐项比对。
 OPTIONS_JS = (
-    '<script>window.__templateOptions = '
+    '<script>window.__namingOptions = '
     + OPTIONS.read_text(encoding="utf-8")
     + ';</script>\n'
 )

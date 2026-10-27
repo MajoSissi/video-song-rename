@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // 这个文件是「怎么把识别结果拼成文件名」的**唯一实现**。
@@ -64,6 +65,17 @@ type Template struct {
 	Separator string `json:"separator"`
 	// Slots 按顺序渲染。
 	Slots []Slot `json:"slots"`
+	// KeepDuplicates 让同一个变量的重复取值**照样各写一遍**。
+	//
+	// 默认 false，也就是「重复的只留先出现的那一个」。场景是这样的：
+	// 「原版歌名 - 英文歌名 - 艺人」对一首英文歌来说，原版歌名本来就是英语，
+	// 和英文歌名一字不差 —— 不去重的话文件名里同一句话出现两遍。
+	// 艺人同理（大部分艺人只有一种写法）。
+	//
+	// 注意零值就是「去重」，这是**故意**的：老配置里没有这个键，
+	// 读进来是 false，正好落在想要的行为上，不需要任何迁移代码。
+	// 想保留重复的人才去勾一下，那时才写 true。
+	KeepDuplicates bool `json:"keep_duplicates"`
 }
 
 // DefaultSeparator 是新模板的默认分隔符。
@@ -106,14 +118,32 @@ func (s Slot) Value(f Fields) string {
 //
 // 顺序即优先级：先写的排前面。空槽直接跳过，所以「跳过一个」不会
 // 在结果里留下任何痕迹——没有多余的分隔符，也没有多余的空格。
+//
+// 同一个变量在不同语种下取到同一句话时（英文歌的原版名和英文名），
+// 后出现的那一格按空槽处理，同样不留痕迹。判定见 repeatKey。
 func (t Template) Render(f Fields) string {
 	var out strings.Builder
 	written := false
+
+	// seen 只记「已经写出去的取值」，key 由 repeatKey 给出。
+	// 不需要预先分配：绝大多数规则只有三四个槽位，而且很少真的重复。
+	var seen map[string]bool
 
 	for _, slot := range t.Slots {
 		value := strings.TrimSpace(slot.Value(f))
 		if value == "" {
 			continue
+		}
+		if !t.KeepDuplicates {
+			if key := repeatKey(slot, value); key != "" {
+				if seen[key] {
+					continue
+				}
+				if seen == nil {
+					seen = make(map[string]bool, len(t.Slots))
+				}
+				seen[key] = true
+			}
 		}
 		if written {
 			out.WriteString(t.separatorFor(slot))
@@ -130,6 +160,44 @@ func (t Template) Render(f Fields) string {
 	// 两端不该有空白。中间的空白是用户自己写的分隔符，一律不动——
 	// 老代码把连续空白压成一个空格，那是在替用户改他的分隔符。
 	return strings.TrimSpace(out.String())
+}
+
+// repeatKey 给出这一格「判重用的键」，空串表示这一格不参与判重。
+//
+// 只在同一个变量内部判重：歌名和艺人恰好同名时两边都留着，那是真的两个信息，
+// 不是重复。年份、原文件名、固定文字也不判重——固定文字写两遍是用户故意的
+// （比如在一头一尾各加一个分隔性符号）。
+func repeatKey(slot Slot, value string) string {
+	switch slot.Var {
+	case VarTitle, VarArtist, VarAlbum:
+	default:
+		return ""
+	}
+	key := foldKey(value)
+	if key == "" {
+		return ""
+	}
+	// 拼上变量名，免得将来加变量时不同变量的同名取值撞在一起。
+	return slot.Var + "\x00" + key
+}
+
+// foldKey 把一句话压成「判重用的形状」：忽略大小写、空白和标点。
+//
+//   - "Spring Day" / "spring day" / "Spring  Day!" 是同一句
+//   - "AC/DC" 和 "ACDC" 也会被判成同一句 —— 认了，同一首歌在不同语种下
+//     几乎不会只差一个斜杠；反过来（把斜杠算进键里）的代价是漏掉真正的重复。
+//
+// 这个结果**只用来比较**，绝不能拿去渲染：它把标点和空白都吃掉了。
+func foldKey(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	for _, r := range text {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			continue
+		}
+		out.WriteRune(unicode.ToLower(r))
+	}
+	return out.String()
 }
 
 // IsZero 报告这份模板是不是空的（没有可用槽位）。
@@ -149,6 +217,9 @@ func (t Template) IsZero() bool {
 // 恰恰要靠这个判断（见 config.Load 的旧配置迁移）。
 func (t Template) Equal(other Template) bool {
 	if t.Separator != other.Separator || len(t.Slots) != len(other.Slots) {
+		return false
+	}
+	if t.KeepDuplicates != other.KeepDuplicates {
 		return false
 	}
 	for i := range t.Slots {

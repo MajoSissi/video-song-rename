@@ -57,6 +57,8 @@ shazam-sidecar - 识别媒体文件里的歌曲，输出 JSON
   --language <语言>        首选语言，默认 en-US
   --country <国家>         首选接口国家代码，默认 GB
   --locale <语言>/<国家>   额外再查一次，可重复。每次都是一次完整的接口调用
+  --min-interval <毫秒>    两次请求之间的最小间隔，默认 0。额外语种的几次调用
+                           会按这个间隔依次发出，而不是连成一串
   --timeout <秒>           单次请求超时，默认 20
   --user-agent <字符串>    覆盖 User-Agent（必须是 App 串，浏览器串会被拒）
   --proxy <地址>           代理。不给就跟随 HTTP_PROXY / HTTPS_PROXY 环境变量；
@@ -210,6 +212,7 @@ struct Args {
     language: String,
     country: String,
     locales: Vec<Locale>,
+    min_interval_ms: u64,
     timeout_seconds: u64,
     user_agent: String,
     proxy: ProxyChoice,
@@ -244,6 +247,7 @@ fn parse_args(argv: Vec<String>) -> Result<Parsed, String> {
     let mut language = DEFAULT_LANGUAGE.to_string();
     let mut country = DEFAULT_COUNTRY.to_string();
     let mut locales: Vec<Locale> = Vec::new();
+    let mut min_interval_ms: u64 = 0;
     let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
     let mut user_agent = DEFAULT_USER_AGENT.to_string();
     let mut proxy = ProxyChoice::FollowEnv;
@@ -297,6 +301,12 @@ fn parse_args(argv: Vec<String>) -> Result<Parsed, String> {
                     .parse::<u64>()
                     .map_err(|_| format!("--timeout 不是正整数: {raw}"))?;
             }
+            "--min-interval" => {
+                let raw = value("--min-interval")?;
+                min_interval_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("--min-interval 不是正整数（毫秒）: {raw}"))?;
+            }
             "--user-agent" => user_agent = value("--user-agent")?,
             "--proxy" => proxy = parse_proxy(&value("--proxy")?)?,
             "--ffmpeg" => ffmpeg = Some(PathBuf::from(value("--ffmpeg")?)),
@@ -331,6 +341,7 @@ fn parse_args(argv: Vec<String>) -> Result<Parsed, String> {
         language,
         country,
         locales,
+        min_interval_ms,
         timeout_seconds,
         user_agent,
         proxy,
@@ -627,8 +638,22 @@ fn main() -> ExitCode {
                 push_unique(&mut titles, &track.title);
                 push_unique(&mut artists, &track.artist);
 
+                // 额外语种循环里吃到 429 时记在这里：文件本身已经有结果了，
+                // 但这条 IP 已经被盯上，Go 侧要凭它让整条流水线慢下来。
+                let mut limited: Option<u64> = None;
+
                 for locale in args.locales.iter() {
-                    let Ok(other) = shazam::lookup(
+                    // 这几次调用也得守同一个节奏。编排层只能节流「文件之间」，
+                    // 文件内部的这几次它根本看不见 —— 不在这里睡，一个配了
+                    // 四个语种的文件就是五次请求零间隔齐射。
+                    if args.min_interval_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            args.min_interval_ms,
+                        ))
+                        .await;
+                    }
+
+                    match shazam::lookup(
                         &client,
                         &signature,
                         &locale.language,
@@ -636,14 +661,22 @@ fn main() -> ExitCode {
                         &args.user_agent,
                     )
                     .await
-                    else {
-                        continue;
-                    };
-                    if !other.matched {
-                        continue;
+                    {
+                        Ok(other) => {
+                            if other.matched {
+                                push_unique(&mut titles, &other.title);
+                                push_unique(&mut artists, &other.artist);
+                            }
+                        }
+                        // 被限流就停手：剩下的语种再问也是一样的结果，
+                        // 而每问一次都会把封禁窗口撞得更长。
+                        Err(shazam::LookupError::RateLimited(seconds)) => {
+                            limited = Some(seconds.unwrap_or(0));
+                            break;
+                        }
+                        // 其它错误（网络抖动、5xx）换个语种还有可能成。
+                        Err(_) => continue,
                     }
-                    push_unique(&mut titles, &other.title);
-                    push_unique(&mut artists, &other.artist);
                 }
 
                 emit(
@@ -662,6 +695,8 @@ fn main() -> ExitCode {
                         "track_key": track.track_key,
                         "titles": titles,
                         "artists": artists,
+                        "rate_limited": limited.is_some(),
+                        "retry_after": limited.unwrap_or(0),
                         "segment_seconds": args.seconds,
                     }),
                     args.pretty,
@@ -680,7 +715,7 @@ fn main() -> ExitCode {
             ),
             Err(error) => {
                 let code = match error {
-                    shazam::LookupError::RateLimited => EXIT_RATE_LIMITED,
+                    shazam::LookupError::RateLimited(_) => EXIT_RATE_LIMITED,
                     shazam::LookupError::Network(_) => EXIT_NETWORK,
                     shazam::LookupError::Upstream(_) => EXIT_UPSTREAM,
                     shazam::LookupError::Rejected(_) => EXIT_UPSTREAM,
@@ -690,6 +725,7 @@ fn main() -> ExitCode {
                         "ok": false,
                         "status": error.kind(),
                         "retryable": error.retryable(),
+                        "retry_after": error.retry_after().unwrap_or(0),
                         "error": error.to_string(),
                         "file": args.file.display().to_string(),
                     }),
@@ -799,5 +835,39 @@ mod tests {
     fn bad_proxy_url_surfaces_the_address() {
         let error = build_client(&ProxyChoice::Url("http://".into()), 5).unwrap_err();
         assert!(error.contains("http://"), "错误里要带上填的那个地址: {error}");
+    }
+
+    #[test]
+    fn min_interval_is_optional_and_parsed_in_ms() {
+        // 不传就是 0：此时 sidecar 一次多余的一次睡眠都不做，
+        // 老版本 Go 侧（不传这个参数）的行为完全不变。
+        match parse_args(vec!["--file".into(), "a.mp4".into()]).unwrap() {
+            Parsed::Run(args) => assert_eq!(args.min_interval_ms, 0),
+            _ => panic!("应当解析成 Run"),
+        }
+
+        match parse_args(vec![
+            "--file".into(),
+            "a.mp4".into(),
+            "--min-interval".into(),
+            "1500".into(),
+        ])
+        .unwrap()
+        {
+            Parsed::Run(args) => assert_eq!(args.min_interval_ms, 1500),
+            _ => panic!("应当解析成 Run"),
+        }
+    }
+
+    #[test]
+    fn rate_limited_error_carries_retry_after() {
+        // Go 侧靠这个字段决定冷却多久；写成 HTTP-date 那种形式解析不了就给 None，
+        // 让它用自己的退避曲线，别在这边猜。
+        let err = shazam::LookupError::RateLimited(Some(42));
+        assert_eq!(err.kind(), "rate_limited");
+        assert_eq!(err.retry_after(), Some(42));
+        assert!(err.to_string().contains("42"));
+
+        assert_eq!(shazam::LookupError::RateLimited(None).retry_after(), None);
     }
 }

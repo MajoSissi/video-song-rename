@@ -26,7 +26,7 @@ func TestRevealCommandKeepsSelectOutsideTheQuotes(t *testing.T) {
 	paths := []string{
 		`C:\Users\a b\My Videos\song.mp4`, // 带空格：os/exec 会整段加引号的那种
 		`D:\videos\a.mp4`,                 // 不带空格：os/exec 拼出来恰好是对的，容易让人以为没问题
-		`D:\我的视频\歌 曲.mp4`,             // 非 ASCII + 空格
+		`D:\我的视频\歌 曲.mp4`,                 // 非 ASCII + 空格
 	}
 
 	for _, path := range paths {

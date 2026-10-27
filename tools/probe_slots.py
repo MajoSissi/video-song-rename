@@ -1,12 +1,12 @@
-"""只跑模板页那三个行为探针，用来做变异测试。
+"""只跑命名页那两个行为探针，用来做变异测试。
 
 为什么单独开一个入口：完整套件要截十几张图加九个探针，跑一轮四十多秒；
 而验证「断言真的会变红」需要连着改坏好几处、每处跑一次，
 用完整套件做这件事太慢，慢到会让人不想做 —— 不想做的检查等于没有检查。
 
-三个探针各跑一次页面加载：槽位编辑器那个会反复增删槽位，
-右键菜单那个会把模板删到只剩一份，拖放那个只碰窗口级的遮罩 ——
-放同一页里会互相干扰。
+两个探针各跑一次页面加载：槽位编辑器那个会反复增删槽位，
+拖放那个只碰窗口级的遮罩 —— 放同一页里会互相干扰。
+（原先还有第三个「模板右键菜单」，跟着模板库一起删了。）
 
 用法：
     python tools/probe_slots.py            # 跑一次，打印结论
@@ -48,8 +48,7 @@ def main() -> int:
     base = f"http://127.0.0.1:{port}/index.html"
 
     cases = [
-        ("槽位编辑器", f"{base}#templates+slotprobe", "data-slot-probe", shoot_ui.check_slots),
-        ("模板右键菜单", f"{base}#templates+menuprobe", "data-menu-probe", shoot_ui.check_tpl_menu),
+        ("槽位编辑器", f"{base}#naming+slotprobe", "data-slot-probe", shoot_ui.check_slots),
         ("拖放遮罩", f"{base}#tasks+dragprobe", "data-drag-probe", shoot_ui.check_drag),
     ]
 

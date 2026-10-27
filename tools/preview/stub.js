@@ -3,38 +3,51 @@
 (function () {
   const wait = (v, ms) => new Promise((r) => setTimeout(() => r(v), ms || 12));
 
-  // 模板是**槽位**形状：separator 是全局分隔符，slots 按顺序拼。
+  // 命名规则是**槽位**形状：separator 是全局分隔符，slots 按顺序拼。
   // 每一格的 separator 为 null 表示「跟随全局」，为空串表示「明确不要分隔符」。
-  const templates = [
-    { name: '只歌名', separator: ' - ', slots: [{ var: 'title' }], active: false },
-    { name: '歌名 - 艺人', separator: ' - ',
-      slots: [{ var: 'title' }, { var: 'artist' }], active: false },
-    { name: '艺人 - 歌名', separator: ' - ',
-      slots: [{ var: 'artist' }, { var: 'title' }], active: false },
-    { name: '歌名 (年份)', separator: ' - ',
-      slots: [{ var: 'title' },
-              { var: 'year', prefix: ' (', suffix: ')', separator: '' }], active: false },
-    { name: '艺人 - 英文名 - 中文名', separator: ' - ',
-      slots: [{ var: 'artist' },
-              { var: 'title', script: 'en' },
-              { var: 'title', script: 'zh' }], active: true },
-  ];
+  //
+  // 全局只有这一份 —— 模板库删掉之后，这一段就是「命名」页的全部内容。
+  let naming = {
+    separator: ' - ',
+    slots: [
+      { var: 'artist' },
+      { var: 'title', script: 'en' },
+      { var: 'title', script: 'zh' },
+    ],
+    unmatchedPrefix: '0_',
+    unmatchedSuffix: '',
+    maxNameRunes: 80,
+    // 去重是默认行为（Go 那边零值就是 false = 去重），桩里写出来是为了
+    // 让截图上的勾选框有明确来源，而不是靠「读不到就当 true」。
+    keepDuplicates: false,
+    move: {
+      // 默认是关的（和 config.Default() 一致）。截图要拍的是「第一次打开
+      // 这一页看到的样子」—— 开着的话那一段会把下面「命名预览」挤出去。
+      enabled: false,
+      mode: 'sibling',
+      dir: '',
+      name: '',
+      prefix: '',
+      suffix: '_已整理',
+      matched_only: true,
+    },
+  };
 
   // 变量 / 语种 / 分隔符目录。真实的那份在 Go（naming.Choices 等），
   // 这里用 build_preview.py 注入的那份 —— 它和 tools/shoot_ui.py 读的是
-  // **同一个** template-options.json，frontend_contract_test.go 会逐项比对。
-  const templateOptions = window.__templateOptions;
+  // **同一个** naming-options.json，frontend_contract_test.go 会逐项比对。
+  const namingOptions = window.__namingOptions;
 
   const cfg = {
     segment_seconds: 12,
     concurrency: 3,
     retries: 2,
+    request_interval_ms: 1500,
     language: 'zh',
     country: 'CN',
     timeout_seconds: 20,
     name_template: { separator: ' - ', slots: [{ var: 'artist' }, { var: 'title' }] },
-    templates: templates,
-    active_template: '艺人 - 英文名 - 中文名',
+    move: naming.move,
     unmatched_prefix: '0_',
     unmatched_suffix: '',
     extensions: ['mp4', 'mkv', 'mov', 'avi', 'mp3', 'flac', 'm4a', 'wav'],
@@ -103,6 +116,21 @@
       shazamUrl: 'https://www.shazam.com/song/3',
       newName: 'Lemon - 米津玄師.mp4', message: '预览模式：没有真的改',
     }),
+    // 只搬走、没改名的条目：状态是「已归档」而不是「已改名」。
+    // 少了这一条，那个状态徽标的样式就永远没被截图看见过。
+    mk(9, {
+      status: 'moved', size: 152 * 1024 * 1024, name: 'Hotel California.flac',
+      title: 'Hotel California', artist: 'Eagles', attempts: 1, moved: true,
+      newName: 'Hotel California.flac',
+      newPath: 'D:\\Media\\演唱会\\录屏_已整理\\Hotel California.flac',
+      message: '已移动到 D:\\Media\\演唱会\\录屏_已整理',
+    }),
+    // 限流也是一种「失败」，但界面上必须一眼分得出来：它有自己的颜色、
+    // 自己的筛选项。缺这一条，那块样式就永远没被截图看见过。
+    mk(8, {
+      status: 'rate_limited', size: 64 * 1024 * 1024, name: 'live-set-02.mkv',
+      message: '被 Shazam 限流（HTTP 429），等几分钟后重试', attempts: 2,
+    }),
   ];
 
   // 记录页的四种形态都放一条：可还原、已还原、文件已不在，
@@ -143,6 +171,20 @@
     ResyncQueue: () => wait(items),
     RemoveItems: () => wait(items),
     Clear: () => wait(null),
+    // 重置：条目一个不少，只是每一行的状态回到「待处理」。
+    // 桩里要**真的**改 items —— 预览页点一下就能看到表格从一片彩色变回灰的，
+    // 否则这颗按钮在预览里永远是死的，样式也验不出来。
+    Reset: () => {
+      for (const item of items) {
+        item.status = 'pending';
+        item.message = '';
+        item.newName = '';
+        item.newPath = '';
+        item.attempts = 0;
+        item.moved = false;
+      }
+      return wait(items.slice());
+    },
     Start: () => wait(null),
     Pause: () => wait(null),
     Resume: () => wait(null),
@@ -155,50 +197,30 @@
     OpenLog: () => wait(null),
     OpenConfigFolder: () => wait(null),
     CloseWindow: () => wait(null),
-    Templates: () => wait(templates),
-    SaveTemplate: (input) => {
-      const found = templates.find((t) => t.name === input.name);
-      if (found) { found.separator = input.separator; found.slots = input.slots; }
-      else templates.push({ name: input.name, separator: input.separator, slots: input.slots, active: false });
-      return wait(templates);
-    },
-    SetActiveTemplate: (name) => {
-      templates.forEach((t) => { t.active = (t.name === name); });
-      return wait(templates);
-    },
-    DeleteTemplate: (name) => {
-      const i = templates.findIndex((t) => t.name === name);
-      if (i >= 0) templates.splice(i, 1);
-      if (!templates.some((t) => t.active)) templates[0].active = true;
-      return wait(templates);
-    },
-    RenameTemplate: (oldName, newName) => {
-      const found = templates.find((t) => t.name === oldName);
-      if (found) found.name = newName;
-      return wait(templates);
-    },
-    DuplicateTemplate: (name, newName) => {
-      const found = templates.find((t) => t.name === name);
-      if (found) {
-        // 槽位要拷一份：直接共用的话，改副本会连原件一起改，
-        // 预览页上看着像「复制没生效」。
-        templates.push(Object.assign({}, found, { name: newName, slots: (found.slots || []).slice() }));
-      }
-      return wait(templates);
-    },
-    ResetTemplates: () => wait(templates),
-    TemplateEditorOptions: () => wait(templateOptions),
+    Naming: () => wait(naming),
+    NamingOptions: () => wait(namingOptions),
+    SaveNaming: (input) => { naming = Object.assign({}, input); return wait(naming); },
+    // 归档位置的试算。桩里只按 sibling 规则拼一个给人看的路径，
+    // 真正的判断在 Go（config.MoveRule.TargetDir）。
+    PreviewMove: (rule) => wait(
+      !rule || !rule.enabled
+        ? { dir: '', ok: false, note: '不移动，文件改名后留在原目录' }
+        : {
+          dir: 'D:\\Media\\演唱会\\' + (rule.name || '录屏') + (rule.suffix || ''),
+          ok: true,
+          note: '目录不存在会自动创建；遇到同名文件会加 (1)，不会覆盖',
+        }),
+    PickMoveFolder: () => wait('D:\\Media\\归档'),
     // 桩里的预览文本是**编的**，只为把版式画出来。
     // 真正的渲染只有 Go 那一份（naming.Template.Render）。
-    // 这个预览页是拿来看排版的，不是拿来验行为的。
-    PreviewTemplate: (input) => wait([
+    PreviewNaming: () => wait([
       { label: '全都识别到', note: '艺人、英文名、中文名、年份都有',
         text: 'BTS - Spring Day - 春日', empty: false },
       { label: '缺中文歌名', note: '只有英文写法 —— 中文那一格整个消失，不留分隔符',
         text: 'BTS - Spring Day', empty: false },
       { label: '只识别到歌名', note: '艺人和专辑都没识别到',
         text: 'Spring Day', empty: false },
-      { label: '完全没识别到', note: '走「未识别」前缀，模板不参与',
+      { label: '完全没识别到', note: '走「未识别」前缀，规则不参与',
         text: '0_VID_20240103_210455', empty: false },
     ]),
     History: () => wait(history),
@@ -269,4 +291,19 @@
   };
   window.__stubEvents = events;
   window.__dropFiles = (paths) => onFileDrop && onFileDrop(0, 0, paths);
+
+  // ?cooldown=45：让顶栏那个「限流冷却」倒计时出现。
+  //
+  // 冷却只在真的被 Shazam 挡下来时才有，静态预览里根本看不到 ——
+  // 于是这块样式永远没被截图验证过。桩的数据本来就是编的，补一条进度事件即可。
+  const cooldownSeconds = Number(new URLSearchParams(location.search).get('cooldown') || 0);
+  if (cooldownSeconds > 0) {
+    setTimeout(() => {
+      (events['job:progress'] || []).forEach((cb) => cb({
+        total: 12, done: 4, matched: 3, unmatched: 1, failed: 0, skipped: 0,
+        rateLimited: 2, running: true,
+        cooldownUntil: Date.now() + cooldownSeconds * 1000,
+      }));
+    }, 200);
+  }
 })();

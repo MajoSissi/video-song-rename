@@ -184,49 +184,61 @@ func (a *App) mutateConfig(mutate func(*config.Config) error) error {
 	return err
 }
 
-// ---------------------------------------------------------------- 模板
+// ---------------------------------------------------------------- 命名
 
-// TemplateInfo 是推给界面的一份模板。
-type TemplateInfo struct {
-	Name string `json:"name"`
+// NamingRule 是「命名」页的完整内容：一套命名规则 + 处理完之后把文件放哪儿。
+//
+// 两者放在同一个载荷里，是因为它们回答的是同一个问题——
+// 「处理完之后，磁盘上会多出什么」。分成两页两个保存按钮，用户会以为
+// 只改了一半，而实际上一次任务两件都会生效。
+type NamingRule struct {
 	// Separator 是全局分隔符，没单独设分隔符的槽位用它。
 	Separator string `json:"separator"`
 	// Slots 是排好序的槽位。每格自带可选的语种、分隔符、前后缀。
-	Slots  []naming.Slot `json:"slots"`
-	Active bool          `json:"active"`
+	Slots []naming.Slot `json:"slots"`
+	// UnmatchedPrefix / UnmatchedSuffix 是未识别文件的标记。
+	//
+	// 它和命名规则在同一页，也应当同一次保存：未识别怎么称呼、
+	// 识别到怎么称呼，本来就是「命名」这一个问题的两面。
+	UnmatchedPrefix string `json:"unmatchedPrefix"`
+	UnmatchedSuffix string `json:"unmatchedSuffix"`
+	// MaxNameRunes 是文件名（不含扩展名）的字符数上限。
+	MaxNameRunes int `json:"maxNameRunes"`
+	// KeepDuplicates 是「重复的照样写两遍」。
+	//
+	// 默认 false = 去重。界面上那颗勾选框是**反着**绑的（勾上 = 去重），
+	// 因为用户想的是「重复的别重复写」，而不是「保留重复」。
+	KeepDuplicates bool `json:"keepDuplicates"`
+	// Move 是归档规则。
+	Move config.MoveRule `json:"move"`
 }
 
-// TemplateInput 是界面传回来的一份模板。
-//
-// 和 TemplateInfo 分开是因为输入里不该有 Active——那是「当前选中」，
-// 由 SetActiveTemplate 单独管，混在保存里会出现「存一下顺手把选中项也改了」。
-type TemplateInput struct {
-	Name      string        `json:"name"`
-	Separator string        `json:"separator"`
-	Slots     []naming.Slot `json:"slots"`
+// spec 把界面上的槽位还原成渲染规则。
+func (r NamingRule) spec() naming.Template {
+	return naming.Template{
+		Separator:      r.Separator,
+		Slots:          r.Slots,
+		KeepDuplicates: r.KeepDuplicates,
+	}
 }
 
-// TemplateEditor 是模板页要用的全部静态选项。
+// NamingOptions 是命名页要用的全部静态选项。
 //
 // 变量目录放在 Go 这边，前端不再各写一份：
 // 前后端之间是字符串约定，`{title:zh}` 在前端写成 `{title:cn}` 不会有任何编译错误，
 // 只会在用户点保存之后才悄悄出错。
-type TemplateEditor struct {
+type NamingOptions struct {
 	// Choices 是槽位下拉框的选项，已经拍平成「中文歌名」这样的成品名。
 	Choices []naming.Choice `json:"choices"`
-	// Default 是新建模板时预填的分隔符。
-	//
-	// 以前这里还有一份 Separators（给分隔符快捷按钮用的一排符号），
-	// 按钮撤掉之后就没有消费者了，一并删掉——留着一个没人读的字段，
-	// 下次改的人还得先搞清楚它是不是还在用。
-	Default string `json:"defaultSeparator"`
+	// DefaultSeparator 是换到一份空规则时预填的分隔符。
+	DefaultSeparator string `json:"defaultSeparator"`
 }
 
-// TemplateEditorOptions 返回模板页的静态选项。
-func (a *App) TemplateEditorOptions() TemplateEditor {
-	return TemplateEditor{
-		Choices: naming.Choices(),
-		Default: naming.DefaultSeparator,
+// NamingOptions 返回命名页的静态选项。
+func (a *App) NamingOptions() NamingOptions {
+	return NamingOptions{
+		Choices:          naming.Choices(),
+		DefaultSeparator: naming.DefaultSeparator,
 	}
 }
 
@@ -285,23 +297,74 @@ func previewSamples() []previewSample {
 		{label: "全都识别到", note: "艺人、英文名、中文名、年份都有", fields: withBoth, matched: true},
 		{label: "缺中文歌名", note: "只有英文写法 —— 中文那一格整个消失，不留分隔符", fields: englishOnly, matched: true},
 		{label: "只识别到歌名", note: "艺人和专辑都没识别到", fields: titleOnly, matched: true},
-		{label: "完全没识别到", note: "走「未识别」前缀，模板不参与", fields: naming.Fields{Original: sampleFile}, matched: false},
+		{label: "完全没识别到", note: "走「未识别」前缀，规则不参与", fields: naming.Fields{Original: sampleFile}, matched: false},
 	}
 }
 
-// PreviewTemplate 用几组样本把这份模板渲染一遍，给界面做预览。
+// Naming 返回当前的命名规则与归档位置。
+func (a *App) Naming() NamingRule {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return NamingRule{
+		Separator:       a.cfg.NameTemplate.Separator,
+		Slots:           append([]naming.Slot(nil), a.cfg.NameTemplate.Slots...),
+		UnmatchedPrefix: a.cfg.UnmatchedPrefix,
+		UnmatchedSuffix: a.cfg.UnmatchedSuffix,
+		MaxNameRunes:    a.cfg.MaxNameRunes,
+		KeepDuplicates:  a.cfg.NameTemplate.KeepDuplicates,
+		Move:            a.cfg.Move,
+	}
+}
+
+// SaveNaming 保存命名规则与归档位置。
+func (a *App) SaveNaming(input NamingRule) (NamingRule, error) {
+	spec := input.spec()
+	spec.Normalize()
+	// 一格都不剩的规则等于没规则。存下去会被 Normalize 换回默认值，
+	// 用户看到的是「保存成功了但名字还是老样子」——不如当场说清楚。
+	if spec.IsZero() {
+		return a.Naming(), errors.New("至少要留一个槽位")
+	}
+
+	move := input.Move
+	move.Normalize()
+	// 用一条样例路径试着算一次：算得出来就说明填的东西够用。
+	// 不试的话，用户会带着一条永远不生效的归档规则去跑任务，而界面上很安静。
+	if move.Enabled && move.TargetDir(filepath.Join("D:", "视频", "2024", "sample.mp4")) == "" {
+		return a.Naming(), errors.New("归档位置还没填完整：选一个目录，或者给目录起个名字")
+	}
+
+	if err := a.mutateConfig(func(cfg *config.Config) error {
+		cfg.NameTemplate = spec
+		cfg.UnmatchedPrefix = input.UnmatchedPrefix
+		cfg.UnmatchedSuffix = input.UnmatchedSuffix
+		cfg.MaxNameRunes = input.MaxNameRunes
+		cfg.Move = move
+		return nil
+	}); err != nil {
+		return a.Naming(), err
+	}
+	return a.Naming(), nil
+}
+
+// PreviewNaming 用几组样本把这份规则渲染一遍，给界面做预览。
 //
 // 预览**在 Go 里算**，不在前端用 JS 重写一遍渲染逻辑。
 // 两处各写一份迟早会对不上：用户看到的预览就成了假的，
 // 而且越是「看起来没问题」越不容易被发现。
-func (a *App) PreviewTemplate(input TemplateInput) []PreviewCase {
-	spec := naming.Template{Separator: input.Separator, Slots: input.Slots}
+func (a *App) PreviewNaming(input NamingRule) []PreviewCase {
+	spec := input.spec()
 	spec.Normalize()
 
-	a.mu.Lock()
-	unmatched := a.cfg.UnmatchedNaming()
-	maxRunes := a.cfg.MaxNameRunes
-	a.mu.Unlock()
+	// 用**表单里的**未识别前缀和长度上限，不是已保存的那份：
+	// 用户改完想先看一眼，这个顺序是合理的。
+	unmatched := naming.Unmatched{Prefix: input.UnmatchedPrefix, Suffix: input.UnmatchedSuffix}
+	maxRunes := input.MaxNameRunes
+	if maxRunes <= 0 {
+		a.mu.Lock()
+		maxRunes = a.cfg.MaxNameRunes
+		a.mu.Unlock()
+	}
 
 	samples := previewSamples()
 	out := make([]PreviewCase, 0, len(samples))
@@ -320,214 +383,43 @@ func (a *App) PreviewTemplate(input TemplateInput) []PreviewCase {
 	return out
 }
 
-// templateList 把模板库整理成界面要的形状。
-func (a *App) templateList() []TemplateInfo {
-	a.mu.Lock()
-	cfg := a.cfg
-	a.mu.Unlock()
-
-	list := make([]TemplateInfo, 0, len(cfg.Templates))
-	for _, tpl := range cfg.Templates {
-		list = append(list, TemplateInfo{
-			Name:      tpl.Name,
-			Separator: tpl.Separator,
-			Slots:     tpl.Slots,
-			Active:    tpl.Name == cfg.ActiveTemplate,
-		})
-	}
-	return list
+// MovePreview 是归档位置的一次试算。
+type MovePreview struct {
+	Dir  string `json:"dir"`
+	Note string `json:"note"`
+	// OK 为假时 Dir 没有意义，界面只显示 Note。
+	OK bool `json:"ok"`
 }
 
-// Templates 返回模板库与当前选中项。
-func (a *App) Templates() []TemplateInfo { return a.templateList() }
-
-// SaveTemplate 新增或修改一份模板。同名即修改。
-func (a *App) SaveTemplate(input TemplateInput) ([]TemplateInfo, error) {
-	name := strings.TrimSpace(input.Name)
-
-	spec := naming.Template{Separator: input.Separator, Slots: input.Slots}
-	spec.Normalize()
-
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		if name == "" {
-			return errors.New("模板名不能是空的")
-		}
-		// 一格都不剩的模板等于没规则。存下去会被 Normalize 丢掉，
-		// 用户看到的是「保存成功了但列表里没有」——不如当场说清楚。
-		if spec.IsZero() {
-			return errors.New("至少要留一个槽位")
-		}
-
-		for index := range cfg.Templates {
-			if cfg.Templates[index].Name == name {
-				cfg.Templates[index].Template = spec
-				return nil
-			}
-		}
-
-		cfg.Templates = append(cfg.Templates, config.Template{Name: name, Template: spec})
-		// 新加的模板直接设为当前：加一份模板多半就是想用它。
-		cfg.ActiveTemplate = name
-		return nil
-	})
-	if err != nil {
-		return a.templateList(), err
-	}
-	return a.templateList(), nil
-}
-
-// DeleteTemplate 删掉一份模板。
-func (a *App) DeleteTemplate(name string) ([]TemplateInfo, error) {
-	name = strings.TrimSpace(name)
-
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		if !config.HasTemplate(cfg.Templates, name) {
-			return fmt.Errorf("没有叫「%s」的模板", name)
-		}
-		// 最后一份不让删。删空之后 Normalize 会把内置模板铺回来，
-		// 用户会以为「删了怎么又自己回来了」——不如直接说清楚。
-		if len(cfg.Templates) <= 1 {
-			return errors.New("至少要留一份模板")
-		}
-
-		kept := make([]config.Template, 0, len(cfg.Templates)-1)
-		for _, tpl := range cfg.Templates {
-			if tpl.Name != name {
-				kept = append(kept, tpl)
-			}
-		}
-		cfg.Templates = kept
-		if cfg.ActiveTemplate == name {
-			cfg.ActiveTemplate = kept[0].Name
-		}
-		return nil
-	})
-	if err != nil {
-		return a.templateList(), err
-	}
-	return a.templateList(), nil
-}
-
-// RenameTemplate 改一份模板的名字，槽位和分隔符原样保留。
+// PreviewMove 拿一条样例路径算一下文件会落到哪个目录。
 //
-// 为什么单开一个方法，而不是前端「存一份新的 + 删掉旧的」：
-// 那两步之间有一段**两份同时存在**的窗口，中间任何一步失败都会留下一个
-// 多余的模板，而用户只是按了一下「重命名」。原子改一次名字没有这个问题。
-func (a *App) RenameTemplate(oldName, newName string) ([]TemplateInfo, error) {
-	oldName = strings.TrimSpace(oldName)
-	newName = strings.TrimSpace(newName)
-
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		if newName == "" {
-			return errors.New("模板名不能是空的")
-		}
-		// 名字没变就直接过。这条必须挡在「重名」检查**前面** ——
-		// 否则改成自己会被判成「已经有一份叫这个名字的模板了」。
-		if newName == oldName {
-			return nil
-		}
-		if !config.HasTemplate(cfg.Templates, oldName) {
-			return fmt.Errorf("没有叫「%s」的模板", oldName)
-		}
-		// 撞名时拒绝，而不是顶掉。这里和 SaveTemplate 的「同名即修改」是
-		// 两条不同的规矩：那边用户明确是在编辑这一份，这边用户以为自己在
-		// 改名字，撞名顶掉等于**悄悄删掉**另一份模板。
-		if config.HasTemplate(cfg.Templates, newName) {
-			return fmt.Errorf("已经有一份叫「%s」的模板了，换个名字", newName)
-		}
-		for index := range cfg.Templates {
-			if cfg.Templates[index].Name == oldName {
-				cfg.Templates[index].Name = newName
-				break
-			}
-		}
-		// 改的正好是当前使用的那一份 → 跟着改名。
-		// 不跟的话 ActiveTemplate 会指向一个不存在的名字，
-		// 归一化时又会把它悄悄挪到第一份去。
-		if cfg.ActiveTemplate == oldName {
-			cfg.ActiveTemplate = newName
-		}
-		return nil
-	})
-	if err != nil {
-		return a.templateList(), err
+// 传进来的是**表单里当前的规则**，不是已保存的那份：用户改完想先看一眼再保存，
+// 这个顺序是合理的，不该逼他先存一个可能是错的配置。
+func (a *App) PreviewMove(rule config.MoveRule, sample string) MovePreview {
+	rule.Normalize()
+	if !rule.Enabled {
+		return MovePreview{Note: "不移动，文件改名后留在原目录"}
 	}
-	return a.templateList(), nil
+	if strings.TrimSpace(sample) == "" || !filepath.IsAbs(sample) {
+		sample = filepath.Join("D:", "视频", "2024", "VID_20240103_210455.mp4")
+	}
+
+	dir := rule.TargetDir(sample)
+	if dir == "" {
+		return MovePreview{Note: "还定不出目录：切换到「指定目录」并选一个，或者给同级目录起个名字"}
+	}
+	return MovePreview{
+		Dir:  dir,
+		OK:   true,
+		Note: "目录不存在会自动创建；遇到同名文件会加 (1)，不会覆盖",
+	}
 }
 
-// DuplicateTemplate 复制一份模板，新名字由调用方给。
-func (a *App) DuplicateTemplate(name, newName string) ([]TemplateInfo, error) {
-	name = strings.TrimSpace(name)
-	newName = strings.TrimSpace(newName)
-
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		if newName == "" {
-			return errors.New("模板名不能是空的")
-		}
-		var source *config.Template
-		for index := range cfg.Templates {
-			if cfg.Templates[index].Name == name {
-				source = &cfg.Templates[index]
-				break
-			}
-		}
-		if source == nil {
-			return fmt.Errorf("没有叫「%s」的模板", name)
-		}
-		if config.HasTemplate(cfg.Templates, newName) {
-			return fmt.Errorf("已经有一份叫「%s」的模板了，换个名字", newName)
-		}
-
-		copied := *source
-		copied.Name = newName
-		// 槽位切片得单独拷一份。共用一个底层数组的话，以后任何一处
-		// 「就地改一下槽位」都会同时改到另一份模板 —— 而两份的名字
-		// 差得挺远，看起来完全不像有关联。
-		copied.Slots = append([]naming.Slot(nil), source.Slots...)
-		cfg.Templates = append(cfg.Templates, copied)
-
-		// **不**动 ActiveTemplate。复制是「多留一份」，不是「切过去用」；
-		// 用哪份模板由任务页那颗下拉现场决定。
-		return nil
+// PickMoveFolder 弹目录选择框，给「指定目录」用。
+func (a *App) PickMoveFolder() (string, error) {
+	return wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "选择处理完之后把文件放进哪个目录",
 	})
-	if err != nil {
-		return a.templateList(), err
-	}
-	return a.templateList(), nil
-}
-
-// SetActiveTemplate 切换当前使用的模板。
-func (a *App) SetActiveTemplate(name string) ([]TemplateInfo, error) {
-	name = strings.TrimSpace(name)
-
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		if !config.HasTemplate(cfg.Templates, name) {
-			return fmt.Errorf("没有叫「%s」的模板", name)
-		}
-		cfg.ActiveTemplate = name
-		return nil
-	})
-	if err != nil {
-		return a.templateList(), err
-	}
-	return a.templateList(), nil
-}
-
-// ResetTemplates 把模板库恢复成内置的那几份。
-//
-// 界面上**没有**对应的按钮（原来底栏那颗「恢复内置模板」按 Majo 的要求撤掉了）：
-// 用哪份模板由任务页那颗下拉现场决定，模板页不需要再放一个开关。
-// 方法留着是因为它是模板库被改坏之后唯一的退路，代价只是几十行没有调用方的代码。
-func (a *App) ResetTemplates() ([]TemplateInfo, error) {
-	err := a.mutateConfig(func(cfg *config.Config) error {
-		cfg.Templates = config.BuiltinTemplates()
-		cfg.ActiveTemplate = cfg.Templates[0].Name
-		return nil
-	})
-	if err != nil {
-		return a.templateList(), err
-	}
-	return a.templateList(), nil
 }
 
 // ---------------------------------------------------------------- 窗口与托盘
@@ -624,7 +516,11 @@ func (a *App) trayState() trayStatus {
 
 	pending := 0
 	for _, item := range items {
-		if item.Status == job.StatusPending || item.Status == job.StatusFailed {
+		// 被限流的也算「还有事要做」：托盘那颗「开始」按的就是「接着跑」，
+		// 把它漏掉的话，整批被限流的队列在托盘里会显示成「全部完成」。
+		if item.Status == job.StatusPending ||
+			item.Status == job.StatusFailed ||
+			item.Status == job.StatusRateLimited {
 			pending++
 		}
 	}
@@ -669,7 +565,7 @@ func (a *App) trayToggle() {
 		return
 	}
 
-	if err := a.Start("pending"); err != nil {
+	if err := a.Start(string(job.ScopeResume)); err != nil {
 		a.mu.Lock()
 		tray := a.tray
 		a.mu.Unlock()
@@ -868,6 +764,14 @@ func (a *App) Progress() job.Progress { return a.manager.Progress() }
 // Clear 清空列表。
 func (a *App) Clear() { a.manager.Clear() }
 
+// Reset 把队列里所有条目清回「待处理」，用于整批重新开始。
+//
+// 只清状态，不动磁盘上的文件，也不碰 state.json（下次重新扫描时
+// 「跳过已处理」的判断照旧按那份文件来）。
+func (a *App) Reset() ([]job.Item, error) {
+	return a.manager.Reset()
+}
+
 // ---------------------------------------------------------------- 执行
 
 // Start 开始识别。scope 取 pending / failed / all。
@@ -878,9 +782,9 @@ func (a *App) Start(scope string) error {
 
 	chosen := job.Scope(strings.TrimSpace(scope))
 	switch chosen {
-	case job.ScopePending, job.ScopeFailed, job.ScopeAll:
+	case job.ScopePending, job.ScopeFailed, job.ScopeAll, job.ScopeResume:
 	default:
-		chosen = job.ScopePending
+		chosen = job.ScopeResume
 	}
 
 	// 在后台跑，方法立刻返回，进度靠事件推。

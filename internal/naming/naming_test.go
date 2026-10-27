@@ -594,3 +594,130 @@ func TestFallbackPutsSuffixAfterTheName(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- 重复取值
+
+// englishSong 是一首英文歌的识别结果：原版名和英文名当然是同一句，
+// 艺人也只有一种写法。这就是「歌名会重复」的那个场景。
+func englishSong() Fields {
+	return Fields{
+		Title:   "Spring Day",
+		Artist:  "BTS",
+		Titles:  map[Script]string{ScriptEnglish: "Spring Day"},
+		Artists: map[Script]string{ScriptEnglish: "BTS"},
+	}
+}
+
+func TestRenderDropsRepeatedTitle(t *testing.T) {
+	template := slots(
+		Slot{Var: VarTitle},
+		Slot{Var: VarTitle, Script: "en"},
+		Slot{Var: VarArtist},
+	)
+	if got := template.Render(englishSong()); got != "Spring Day - BTS" {
+		t.Errorf("原版名和英文名是同一句时只该写一次，实际 %q", got)
+	}
+}
+
+func TestRenderDropsRepeatedArtist(t *testing.T) {
+	template := slots(
+		Slot{Var: VarArtist},
+		Slot{Var: VarArtist, Script: "en"},
+		Slot{Var: VarTitle},
+	)
+	if got := template.Render(englishSong()); got != "BTS - Spring Day" {
+		t.Errorf("艺人只有一个写法时不该写两遍，实际 %q", got)
+	}
+}
+
+// 中文歌的正经情况：原版名和英文名不一样，两个都要留。
+// 这条是「去重别做过头」的反向保险。
+func TestRenderKeepsDifferentScripts(t *testing.T) {
+	fields := Fields{
+		Title:  "夜空中最亮的星",
+		Artist: "逃跑计划",
+		Titles: map[Script]string{
+			ScriptEnglish: "The Brightest Star in the Night Sky",
+			ScriptChinese: "夜空中最亮的星",
+		},
+	}
+	template := slots(
+		Slot{Var: VarTitle},
+		Slot{Var: VarTitle, Script: "en"},
+	)
+	want := "夜空中最亮的星 - The Brightest Star in the Night Sky"
+	if got := template.Render(fields); got != want {
+		t.Errorf("不同语种的两个名字都要留，实际 %q，期望 %q", got, want)
+	}
+}
+
+// 判重忽略大小写、空白和标点 —— Shazam 两路返回的同一句话未必一字不差。
+func TestRenderDedupeIgnoresCaseSpaceAndPunctuation(t *testing.T) {
+	fields := Fields{
+		Title:  "Spring Day!",
+		Titles: map[Script]string{ScriptEnglish: "spring  day"},
+	}
+	template := slots(Slot{Var: VarTitle}, Slot{Var: VarTitle, Script: "en"})
+	if got := template.Render(fields); got != "Spring Day!" {
+		t.Errorf("只差大小写和空白时应当算重复，实际 %q", got)
+	}
+}
+
+// 判重只在同一个变量内部做：歌名和艺人恰好同名是巧合，不是重复。
+func TestRenderDedupeDoesNotCrossVariables(t *testing.T) {
+	fields := Fields{Title: "BTS", Artist: "BTS"}
+	template := slots(Slot{Var: VarTitle}, Slot{Var: VarArtist})
+	if got := template.Render(fields); got != "BTS - BTS" {
+		t.Errorf("歌名和艺人同名时两边都该留，实际 %q", got)
+	}
+}
+
+// 重复的那一格连前缀后缀一起消失，不能留下一个孤零零的括号。
+func TestRenderDroppedSlotTakesItsDecoration(t *testing.T) {
+	fields := englishSong()
+	none := ""
+	template := slots(
+		Slot{Var: VarTitle},
+		Slot{Var: VarTitle, Script: "en", Prefix: " (", Suffix: ")", Separator: &none},
+	)
+	if got := template.Render(fields); got != "Spring Day" {
+		t.Errorf("重复的那一格该整格消失，实际 %q", got)
+	}
+}
+
+// 固定文字写两遍是用户故意的（一头一尾各加一个符号），不去重。
+func TestRenderKeepsRepeatedLiteral(t *testing.T) {
+	template := slots(
+		Slot{Var: VarLiteral, Text: "★"},
+		Slot{Var: VarTitle},
+		Slot{Var: VarLiteral, Text: "★"},
+	)
+	if got := template.Render(englishSong()); got != "★ - Spring Day - ★" {
+		t.Errorf("固定文字不该去重，实际 %q", got)
+	}
+}
+
+// 去掉勾的人要能拿回「两段都写」的老行为。
+func TestRenderKeepsDuplicatesWhenAsked(t *testing.T) {
+	template := slots(
+		Slot{Var: VarTitle},
+		Slot{Var: VarTitle, Script: "en"},
+		Slot{Var: VarArtist},
+	)
+	template.KeepDuplicates = true
+	if got := template.Render(englishSong()); got != "Spring Day - Spring Day - BTS" {
+		t.Errorf("KeepDuplicates=true 时应当照写两遍，实际 %q", got)
+	}
+}
+
+// 全是标点的取值判不出重复（foldKey 为空），原样写出去，不会莫名其妙消失。
+func TestRenderDedupeLeavesUnfoldableValue(t *testing.T) {
+	fields := Fields{
+		Title:  "!!!",
+		Titles: map[Script]string{ScriptEnglish: "..."},
+	}
+	template := slots(Slot{Var: VarTitle}, Slot{Var: VarTitle, Script: "en"})
+	if got := template.Render(fields); got != "!!! - ..." {
+		t.Errorf("判不出重复时不该丢，实际 %q", got)
+	}
+}

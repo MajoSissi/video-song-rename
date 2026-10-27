@@ -21,22 +21,51 @@ import (
 	"videosongrename/internal/config"
 	"videosongrename/internal/media"
 	"videosongrename/internal/naming"
+	"videosongrename/internal/pace"
 	"videosongrename/internal/recognizer"
+)
+
+// 限流相关的时间常量。
+//
+// 冷却起点取 60 秒是刻意的：对 IP 级的封禁，5 秒、15 秒这种量级的退避等于没等，
+// 而每撞一次都会把窗口推得更久。上限 15 分钟是为了「别把程序挂死」——
+// 真到了那一档，用户该做的是换个网络或者等一会儿，而不是盯着一个转圈。
+const (
+	cooldownBase = 60 * time.Second
+	cooldownMax  = 15 * time.Minute
+	// maxRateLimitStrikes 是「连续吃几次 429 就停掉整轮」。
+	//
+	// 一次 429 可能只是踩到了窗口边缘，冷却之后还有救；连着两次就说明这条 IP
+	// 确实在被封，继续跑只是拿剩下的几百个文件挨个去撞同一堵墙 ——
+	// 用户看到的会是一片「失败」，而真正的信息只有一句「你被限流了」。
+	maxRateLimitStrikes = 2
 )
 
 // Status 是一个文件在任务里的状态。
 type Status string
 
 const (
-	StatusPending  Status = "pending"  // 已入列，还没处理
-	StatusRunning  Status = "running"  // 正在识别
-	StatusMatched  Status = "matched"  // 识别到曲目
-	StatusNoMatch  Status = "no_match" // 没识别到
-	StatusPreview  Status = "preview"  // 预览模式：算出了新名字但没落盘
-	StatusRenamed  Status = "renamed"  // 已改名
+	StatusPending Status = "pending"  // 已入列，还没处理
+	StatusRunning Status = "running"  // 正在识别
+	StatusMatched Status = "matched"  // 识别到曲目
+	StatusNoMatch Status = "no_match" // 没识别到
+	StatusPreview Status = "preview"  // 预览模式：算出了新名字但没落盘
+	StatusRenamed Status = "renamed"  // 已改名
+	// StatusMoved 是「名字本来就是对的，只把它搬进了归档目录」。
+	//
+	// 和 StatusRenamed 分开是为了不说假话：界面上给一个没改过名的文件
+	// 挂「已重命名」，用户回头去原目录找，会发现名字没变、文件也没了。
+	StatusMoved    Status = "moved"
 	StatusSkipped  Status = "skipped"  // 跳过（已处理过）
 	StatusFailed   Status = "failed"   // 失败（网络/解码/写盘）
 	StatusCanceled Status = "canceled" // 被停止
+	// StatusRateLimited 是被 Shazam 限流（HTTP 429）。
+	//
+	// 必须和 StatusFailed 分开：界面上「失败」是一个笼统的红标，用户看到一片
+	// 红只会以为程序坏了或者链接不通；而限流是一件有明确解法的事——
+	// 等几分钟、把间隔调大、再点开始。分开之后界面上能直接说这句话，
+	// 「只重试失败项」也才会把这一批正确地带上。
+	StatusRateLimited Status = "rate_limited"
 )
 
 // Item 是一个待处理文件，也是推给界面的一行。
@@ -68,6 +97,11 @@ type Item struct {
 	NewPath  string `json:"newPath"`
 	Message  string `json:"message"`
 	Attempts int    `json:"attempts"`
+	// Moved 表示这个文件被搬进过归档目录（见 config.MoveRule）。
+	//
+	// 单独一个布尔量是因为它不能从路径反推：处理完之后 Path 已经是新位置，
+	// 而「搬没搬过」决定界面和汇总里那句话怎么说。
+	Moved bool `json:"moved"`
 }
 
 // Progress 是总体进度快照。
@@ -80,20 +114,31 @@ type Progress struct {
 	Skipped   int  `json:"skipped"`
 	Renamed   int  `json:"renamed"`
 	Running   bool `json:"running"`
+	// Moved 是被搬进归档目录的条目数。
+	Moved int `json:"moved"`
+	// RateLimited 是被限流的条目数。
+	RateLimited int `json:"rateLimited"`
+	// CooldownUntil 是限流冷却的截止时刻（Unix 毫秒），0 表示没在冷却。
+	//
+	// 它是**全局**的，不属于某一条：限流是按 IP 算的，所有 worker 一起停。
+	// 界面拿它倒计时，用户才看得出「程序没卡死，是在等」。
+	CooldownUntil int64 `json:"cooldownUntil"`
 }
 
 // Summary 是任务结束时的汇总。
 type Summary struct {
-	Total     int    `json:"total"`
-	Matched   int    `json:"matched"`
-	Unmatched int    `json:"unmatched"`
-	Failed    int    `json:"failed"`
-	Skipped   int    `json:"skipped"`
-	Renamed   int    `json:"renamed"`
-	Canceled  bool   `json:"canceled"`
-	DryRun    bool   `json:"dryRun"`
-	ElapsedMS int64  `json:"elapsedMs"`
-	Reason    string `json:"reason"`
+	Total       int    `json:"total"`
+	Matched     int    `json:"matched"`
+	Unmatched   int    `json:"unmatched"`
+	Failed      int    `json:"failed"`
+	Skipped     int    `json:"skipped"`
+	Renamed     int    `json:"renamed"`
+	Moved       int    `json:"moved"`
+	RateLimited int    `json:"rateLimited"`
+	Canceled    bool   `json:"canceled"`
+	DryRun      bool   `json:"dryRun"`
+	ElapsedMS   int64  `json:"elapsedMs"`
+	Reason      string `json:"reason"`
 }
 
 // Callbacks 是往外推事件的钩子。任何一个都可以为 nil。
@@ -176,6 +221,12 @@ type Manager struct {
 	pauseMu sync.Mutex
 	paused  bool
 
+	// gate 是所有 worker 共用的请求闸门：管节奏，也管 429 之后的全局冷却。
+	gate *pace.Gate
+	// abortReason 非空表示这一轮是被内部叫停的（限流），不是用户按的停止。
+	// 两者对剩下的条目处置完全不同，见 stopPending。
+	abortReason string
+
 	cfg        config.Config
 	recognizer Recognizer
 	dataDir    string
@@ -189,6 +240,7 @@ func New(cfg config.Config, rec Recognizer, dataDir string, callbacks Callbacks)
 		items:      []Item{},
 		reserved:   map[string]bool{},
 		state:      map[string]stateEntry{},
+		gate:       newGate(cfg),
 		cfg:        cfg,
 		recognizer: rec,
 		dataDir:    dataDir,
@@ -196,11 +248,32 @@ func New(cfg config.Config, rec Recognizer, dataDir string, callbacks Callbacks)
 	}
 }
 
+func newGate(cfg config.Config) *pace.Gate {
+	return pace.NewGate(
+		time.Duration(cfg.RequestIntervalMS)*time.Millisecond,
+		cooldownBase,
+		cooldownMax,
+	)
+}
+
+// gateRef 取当前闸门。走锁是因为设置可以在运行中被替换。
+func (m *Manager) gateRef() *pace.Gate {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gate
+}
+
 // SetConfig 在任务开始前替换设置。
 func (m *Manager) SetConfig(cfg config.Config) {
 	cfg.Normalize()
 	m.mu.Lock()
 	m.cfg = cfg
+	// 闸门跟着重建，冷却也一起清掉。
+	//
+	// 改设置是个「人来接管」的动作：换代理、换间隔之后，之前那条 IP 上
+	// 攒下的封禁不一定还算数，抱着旧的截止时刻拦着只会让用户觉得改设置没用。
+	m.gate = newGate(cfg)
+	m.progress.CooldownUntil = 0
 	m.mu.Unlock()
 }
 
@@ -376,6 +449,67 @@ func (m *Manager) Clear() {
 	}
 }
 
+// Reset 把整张表清回刚扫描完的样子：所有条目回到「待处理」，计数归零。
+//
+// 它解决的是「中途停止之后就再也重来不了」：手动停止会把没轮到的条目标成
+// 「已停止」，而「开始」只认「待处理 / 失败」—— 点下去得到的是一句
+// 「没有需要处理的文件」，界面上却明明挂着一排灰条。
+//
+// 和 Clear 的区别：Clear 把条目整个丢掉（换文件夹时才用它），Reset 一个都不少，
+// 只是把状态抹平。**已经改过名的、扫描时因为 state.json 判为「已处理过」而
+// 跳过的，也一并回到待处理** —— 「重置」的意思就是这一批从头再来一遍，
+// 留一半不动的话，这一排永远清不成同一种颜色。
+//
+// 只动内存，不碰 state.json，也不碰磁盘上的文件。
+func (m *Manager) Reset() ([]Item, error) {
+	if m.IsRunning() {
+		return nil, errors.New("任务正在运行，先停止再重置")
+	}
+
+	m.mu.Lock()
+	for index := range m.items {
+		item := &m.items[index]
+		item.Status = StatusPending
+		item.Message = ""
+		item.NewName = ""
+		item.NewPath = ""
+		item.Attempts = 0
+		// Moved **不清**：文件确实还在归档目录里，清掉的话重跑时会按同一套
+		// 规则把它再搬一次，算出「归档目录的归档目录」。见 archiveTarget。
+		// 识别结果一起清掉。留着的话详情面板还写着上一轮的歌名，
+		// 而状态是「待处理」—— 说的不是同一件事。
+		item.Title = ""
+		item.Artist = ""
+		item.Album = ""
+		item.Genre = ""
+		item.Released = ""
+		item.Label = ""
+		item.CoverArt = ""
+		item.ShazamURL = ""
+		item.Titles = nil
+		item.Artists = nil
+	}
+	// 预留表存的是「改名时占住的路径」，只在跑的时候有意义。
+	m.reserved = map[string]bool{}
+	// 冷却也一起抹掉：重置之后还没开始，界面不该继续挂一个倒计时。
+	m.progress.CooldownUntil = 0
+	m.recountLocked()
+	snapshot := append([]Item(nil), m.items...)
+	progress := m.progress
+	m.mu.Unlock()
+
+	if m.callbacks.OnItem != nil {
+		for _, item := range snapshot {
+			m.callbacks.OnItem(item)
+		}
+	}
+	if m.callbacks.OnProgress != nil {
+		m.callbacks.OnProgress(progress)
+	}
+	m.logf("INFO", "已重置：%d 个条目回到待处理", len(snapshot))
+	return snapshot, nil
+}
+
 // ---------------------------------------------------------------- 执行
 
 // Scope 决定这一轮处理哪些条目。
@@ -386,8 +520,16 @@ type Scope string
 
 const (
 	ScopePending Scope = "pending" // 只处理新扫描出来、还没跑过的
-	ScopeFailed  Scope = "failed"  // 只重试上一轮失败的
+	ScopeFailed  Scope = "failed"  // 只重试上一轮失败的（含被限流的）
 	ScopeAll     Scope = "all"     // 全部重来
+	// ScopeResume 是界面上那颗「开始」按钮和托盘菜单用的：先做没跑过的，
+	// 一个都没有时退到「失败 + 被限流」。
+	//
+	// 单靠 ScopePending 会漏掉一整类情况：整批文件都被限流中止时，剩下的
+	// 虽然还是「待处理」，但**被挡下的那一条**是「被限流」——它既不是待处理，
+	// 也不是普通的失败。用户照着提示等几分钟再点开始，如果没有这条兜底，
+	// 迎来的会是一句「没有需要处理的文件」。
+	ScopeResume Scope = "resume"
 )
 
 // Start 开始识别。
@@ -405,25 +547,49 @@ func (m *Manager) Start(ctx context.Context, scope Scope) error {
 	cfg := m.cfg
 
 	// 选出这一轮要处理的下标。
+	selected := make([]bool, len(m.items))
+	mark := func(match func(Status) bool) int {
+		count := 0
+		for index := range m.items {
+			if selected[index] || !match(m.items[index].Status) {
+				continue
+			}
+			selected[index] = true
+			count++
+		}
+		return count
+	}
+
+	switch scope {
+	case ScopeFailed:
+		// 被限流的也归在这里：「重试上一轮的失败」对用户来说就是
+		// 「把没成的再来一遍」，限流只是失败的一种原因。
+		mark(func(status Status) bool { return status == StatusFailed || status == StatusRateLimited })
+	case ScopeAll:
+		mark(func(status Status) bool { return status != StatusSkipped })
+	case ScopeResume:
+		if mark(func(status Status) bool { return status == StatusPending }) == 0 {
+			// 第二级：上一轮因为限流或手动停止而没跑完的。
+			//
+			// 「已停止」必须算进来。手动点过「停止」之后，没轮到的条目全是这个
+			// 状态，而它不是「待处理」—— 没有这条兜底，用户停下来再点「开始」，
+			// 得到的是一句「没有需要处理的文件」，队列里却挂着一排灰条。
+			// 想整批从头重来（连已改名的一起）用工具栏那颗「重置」。
+			mark(func(status Status) bool {
+				return status == StatusFailed ||
+					status == StatusRateLimited ||
+					status == StatusCanceled
+			})
+		}
+	default:
+		mark(func(status Status) bool { return status == StatusPending })
+	}
+
 	queue := make([]int, 0, len(m.items))
 	for index := range m.items {
-		status := m.items[index].Status
-
-		switch scope {
-		case ScopeFailed:
-			if status != StatusFailed {
-				continue
-			}
-		case ScopeAll:
-			if status == StatusSkipped {
-				continue
-			}
-		default:
-			if status != StatusPending {
-				continue
-			}
+		if !selected[index] {
+			continue
 		}
-
 		// 回到待处理，让界面上的状态是干净的。
 		m.items[index].Status = StatusPending
 		m.items[index].Message = ""
@@ -440,11 +606,18 @@ func (m *Manager) Start(ctx context.Context, scope Scope) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 	m.running = true
+	m.abortReason = ""
 	m.pauseMu.Lock()
 	m.paused = false
 	m.pauseMu.Unlock()
 	m.recountLocked()
 	m.progress.Running = true
+	m.progress.CooldownUntil = 0
+	// 上一轮被限流中止的话，冷却可能还没走完。把它接着显示出来 ——
+	// 否则用户点完「开始」看到的是界面一动不动，而程序其实在等冷却。
+	if until := m.gate.CoolingUntil(); until.After(time.Now()) {
+		m.progress.CooldownUntil = until.UnixMilli()
+	}
 	progress := m.progress
 	m.mu.Unlock()
 
@@ -453,8 +626,12 @@ func (m *Manager) Start(ctx context.Context, scope Scope) error {
 	}
 
 	started := time.Now()
-	m.logf("INFO", "开始处理 %d 个文件（并发 %d，窗口 %d 秒，%s）",
-		len(queue), cfg.Concurrency, cfg.SegmentSeconds, dryRunLabel(cfg.DryRun))
+	m.logf("INFO", "开始处理 %d 个文件（并发 %d，间隔 %d 毫秒，窗口 %d 秒，%s）",
+		len(queue), cfg.Concurrency, cfg.RequestIntervalMS, cfg.SegmentSeconds, dryRunLabel(cfg.DryRun))
+	if progress.CooldownUntil > 0 {
+		m.logf("WARN", "上一轮的限流冷却还没结束，约 %s后才会发第一个请求",
+			humanDuration(time.Until(time.UnixMilli(progress.CooldownUntil))))
+	}
 
 	m.runWorkers(runCtx, queue)
 
@@ -462,27 +639,35 @@ func (m *Manager) Start(ctx context.Context, scope Scope) error {
 	m.running = false
 	m.cancel = nil
 	m.progress.Running = false
+	m.progress.CooldownUntil = 0
+	reason := m.abortReason
 	summary := Summary{
-		Total:     m.progress.Total,
-		Matched:   m.progress.Matched,
-		Unmatched: m.progress.Unmatched,
-		Failed:    m.progress.Failed,
-		Skipped:   m.progress.Skipped,
-		Renamed:   m.progress.Renamed,
-		Canceled:  runCtx.Err() == context.Canceled,
-		DryRun:    cfg.DryRun,
-		ElapsedMS: time.Since(started).Milliseconds(),
+		Total:       m.progress.Total,
+		Matched:     m.progress.Matched,
+		Unmatched:   m.progress.Unmatched,
+		Failed:      m.progress.Failed,
+		Skipped:     m.progress.Skipped,
+		Renamed:     m.progress.Renamed,
+		Moved:       m.progress.Moved,
+		RateLimited: m.progress.RateLimited,
+		Canceled:    runCtx.Err() == context.Canceled,
+		DryRun:      cfg.DryRun,
+		ElapsedMS:   time.Since(started).Milliseconds(),
 	}
 	m.mu.Unlock()
 
 	m.saveState()
 
-	if summary.Canceled {
+	switch {
+	case reason != "":
+		// 限流中止：Reason 里已经写明「等多久、接下来做什么」。
+		summary.Reason = reason
+	case summary.Canceled:
 		summary.Reason = "已手动停止"
 	}
-	m.logf("INFO", "结束：识别 %d，未识别 %d，失败 %d，改名 %d，跳过 %d，耗时 %.1f 秒",
-		summary.Matched, summary.Unmatched, summary.Failed, summary.Renamed, summary.Skipped,
-		float64(summary.ElapsedMS)/1000)
+	m.logf("INFO", "结束：识别 %d，未识别 %d，失败 %d，被限流 %d，改名 %d，跳过 %d，耗时 %.1f 秒",
+		summary.Matched, summary.Unmatched, summary.Failed, summary.RateLimited,
+		summary.Renamed, summary.Skipped, float64(summary.ElapsedMS)/1000)
 
 	if m.callbacks.OnDone != nil {
 		m.callbacks.OnDone(summary)
@@ -521,12 +706,12 @@ func (m *Manager) runWorkers(ctx context.Context, queue []int) {
 			defer wg.Done()
 			for index := range ch {
 				if ctx.Err() != nil {
-					m.markCanceled(index)
+					m.stopPending(index)
 					continue
 				}
 				// 暂停点：等在这里，而不是掐断正在跑的那一次。
 				if !m.waitWhilePaused(ctx) {
-					m.markCanceled(index)
+					m.stopPending(index)
 					continue
 				}
 				m.processOne(ctx, index)
@@ -536,13 +721,55 @@ func (m *Manager) runWorkers(ctx context.Context, queue []int) {
 
 	for _, index := range queue {
 		if ctx.Err() != nil {
-			m.markCanceled(index)
+			m.stopPending(index)
 			continue
 		}
 		ch <- index
 	}
 	close(ch)
 	wg.Wait()
+}
+
+// stopPending 处理「还没轮到就跑不动了」的条目。
+//
+// 手动停止 → 标成「已停止」；限流中止 → **留在「待处理」**。
+//
+// 这两种处置差得很远：被限流中止之后，用户要做的正是等几分钟再点一次「开始」，
+// 而 ScopePending 只认 pending 状态。要是把这些条目也标成「已停止」，
+// 用户再点开始时它们一个都不会被选中 —— 界面看着像是「一批文件跑完了」，
+// 实际上什么都没做。
+func (m *Manager) stopPending(index int) {
+	if m.aborted() {
+		m.update(index, func(item *Item) {
+			if item.Status == StatusPending {
+				item.Message = "等待限流解除后继续"
+			}
+		})
+		return
+	}
+	m.markCanceled(index)
+}
+
+// aborted 报告这一轮是不是被限流叫停的。
+func (m *Manager) aborted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.abortReason != ""
+}
+
+// abort 叫停整轮。reason 会原样出现在汇总里，所以必须写成给用户看的话。
+func (m *Manager) abort(reason string) {
+	m.mu.Lock()
+	if m.abortReason == "" {
+		m.abortReason = reason
+	}
+	cancel := m.cancel
+	m.mu.Unlock()
+
+	m.logf("ERROR", "%s", reason)
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (m *Manager) markCanceled(index int) {
@@ -584,12 +811,21 @@ func (m *Manager) processOne(ctx context.Context, index int) {
 		FFmpegPath:     cfg.FFmpegPath,
 		Proxy:          cfg.Proxy,
 		Locales:        cfg.ExtraLocales(),
+		// sidecar 自己那几次额外语种调用也得守同一个节奏，见 Options 里的注释。
+		RequestIntervalMS: cfg.RequestIntervalMS,
 	}
 
 	result, attempts := m.recognizeWithRetry(ctx, options, cfg.Retries, index)
 
 	if ctx.Err() != nil {
-		m.markCanceled(index)
+		// 限流中止会把 ctx 一起取消，此刻**正在跑的这一条**必须如实记成
+		// 「被限流」，而不是跟着其余条目一起停在「待处理」——它确实撞了墙，
+		// 界面和汇总里都该有这一条。
+		if result.Status == recognizer.StatusRateLimited {
+			m.finishRateLimited(index, attempts)
+			return
+		}
+		m.stopPending(index)
 		return
 	}
 
@@ -598,6 +834,8 @@ func (m *Manager) processOne(ctx context.Context, index int) {
 		m.finishMatched(index, result, attempts)
 	case result.Status == recognizer.StatusNoMatch:
 		m.finishUnmatched(index, attempts)
+	case result.Status == recognizer.StatusRateLimited:
+		m.finishRateLimited(index, attempts)
 	case result.Status == recognizer.StatusUnsupported ||
 		result.Status == recognizer.StatusDecode ||
 		result.Status == recognizer.StatusMissingFile ||
@@ -619,7 +857,17 @@ func (m *Manager) processOne(ctx context.Context, index int) {
 	}
 }
 
-// recognizeWithRetry 按 RetryPlan 的节奏重试，返回最后一次结果与尝试次数。
+// recognizeWithRetry 跑一次识别，按需要重试，返回最后一次结果与尝试次数。
+//
+// 两种失败走两条完全不同的路：
+//
+//   - **限流**（429）由全局闸门处理：冻结所有 worker，等冷却结束再问。它不占用
+//     cfg.Retries —— 那几次重试是留给网络抖动的。连续被挡到 maxRateLimitStrikes
+//     次就停掉整轮：这时候继续跑只是在拿剩下的文件挨个撞同一堵墙。
+//   - **网络/上游**按 RetryPlan 的节奏重试，最多 cfg.Retries 次。
+//
+// 每次请求之前都先在闸门上等一个时刻。这一步不能省：它是「并发数」和
+// 「实际请求速率」之间唯一的联系，少了它，三个 worker 就是同一秒三次请求。
 func (m *Manager) recognizeWithRetry(
 	ctx context.Context,
 	options recognizer.Options,
@@ -629,9 +877,44 @@ func (m *Manager) recognizeWithRetry(
 	attempts := 0
 
 	for {
+		if !m.gateRef().Wait(ctx) {
+			// ctx 结束了。processOne 会先看 ctx 再决定怎么处置条目，
+			// 这里返回什么状态都不影响结果。
+			return recognizer.Result{}, attempts
+		}
+		m.clearCooldown()
+
 		attempts++
 		result, err := m.recognizer.Recognize(ctx, options)
+
+		// 429 要先于「成功」判定。
+		//
+		// `Recognize` 只要拿到了 sidecar 的 JSON 就返回 nil error —— 限流也是
+		// 一份合法 JSON（status = rate_limited），所以「err == nil 就当成成功」
+		// 会把 429 直接放过去。老代码的 429 重试分支从来没被走到，就是这么来的。
+		if err == nil && result.Status == recognizer.StatusRateLimited {
+			strikes, wait, _ := m.freeze(result.RetryAfter)
+			if strikes >= maxRateLimitStrikes {
+				m.abort(fmt.Sprintf(
+					"被 Shazam 限流，已停止本轮。冷却 %s，之后点「开始」继续（剩下的文件都还在队列里）",
+					humanDuration(wait)))
+				return result, attempts
+			}
+			m.logf("WARN", "%s 触发 Shazam 限流，全局冷却 %.0f 秒后重试",
+				filepath.Base(options.Path), wait.Seconds())
+			continue
+		}
+
 		if err == nil {
+			// 命中，但额外语种那几次请求里吃到了 429：文件本身有结果，
+			// 可这条 IP 已经被盯上了，得让所有 worker 一起慢下来。
+			if result.RateLimited {
+				m.freeze(result.RetryAfter)
+				m.logf("WARN", "%s 识别成功，但额外语种请求被限流，全体冷却",
+					filepath.Base(options.Path))
+			} else {
+				m.gateRef().Succeeded()
+			}
 			return result, attempts
 		}
 
@@ -655,6 +938,74 @@ func (m *Manager) recognizeWithRetry(
 	}
 }
 
+// freeze 让整条流水线停下来，并把冷却截止时刻推给界面。
+//
+// 返回的是「连续第几次被挡」「这次冻多久」「冻到什么时候」。
+func (m *Manager) freeze(retryAfter int) (int, time.Duration, time.Time) {
+	strikes, wait, until := m.gateRef().Limited(time.Duration(retryAfter) * time.Second)
+
+	m.mu.Lock()
+	m.progress.CooldownUntil = until.UnixMilli()
+	progress := m.progress
+	m.mu.Unlock()
+
+	if m.callbacks.OnProgress != nil {
+		m.callbacks.OnProgress(progress)
+	}
+	m.logf("WARN", "全体暂停 %.0f 秒（连续第 %d 次限流）", wait.Seconds(), strikes)
+	return strikes, wait, until
+}
+
+// clearCooldown 在冷却结束、真的要发请求时通知界面收掉倒计时。
+//
+// 只在「之前确实在冷却」时才发事件：这条路径每个文件都会走一次，
+// 无条件发一遍等于把进度事件翻一倍，而绝大多数时候界面根本不需要更新。
+func (m *Manager) clearCooldown() {
+	m.mu.Lock()
+	if m.progress.CooldownUntil == 0 {
+		m.mu.Unlock()
+		return
+	}
+	m.progress.CooldownUntil = 0
+	progress := m.progress
+	m.mu.Unlock()
+
+	if m.callbacks.OnProgress != nil {
+		m.callbacks.OnProgress(progress)
+	}
+}
+
+// humanDuration 把时长写成「1 分 20 秒」这种给人看的形状。
+//
+// 向上取整到秒：冷却还剩 0.4 秒时说「0 秒后继续」是句废话。
+func humanDuration(d time.Duration) string {
+	seconds := int((d + time.Second - 1) / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds < 60 {
+		return fmt.Sprintf("%d 秒", seconds)
+	}
+	minutes := seconds / 60
+	if rest := seconds % 60; rest > 0 {
+		return fmt.Sprintf("%d 分 %d 秒", minutes, rest)
+	}
+	return fmt.Sprintf("%d 分钟", minutes)
+}
+
+// finishRateLimited 把一条记成「被限流」。
+//
+// 限流不是「这个文件有问题」，是这个 IP 现在不能再问了。单独一个状态，
+// 界面上才有话可说，也才能靠「重试失败项」把它再跑一遍。
+func (m *Manager) finishRateLimited(index int, attempts int) {
+	m.update(index, func(item *Item) {
+		item.Status = StatusRateLimited
+		item.Attempts = attempts
+		item.Message = "被 Shazam 限流（HTTP 429），等几分钟后重试"
+	})
+	m.bump(func(p *Progress) { p.RateLimited++ })
+}
+
 func (m *Manager) finishMatched(index int, result recognizer.Result, attempts int) {
 	m.mu.Lock()
 	cfg := m.cfg
@@ -672,9 +1023,28 @@ func (m *Manager) finishMatched(index int, result recognizer.Result, attempts in
 	}
 
 	base := naming.Apply(cfg.NameTemplate, cfg.UnmatchedNaming(), fields, cfg.MaxNameRunes, true)
-
 	newName := base + item.Ext
-	if media.SamePath(item.Dir+string(os.PathSeparator)+newName, item.Path) {
+
+	// 归档目录：空串表示不移动。识别成功的这条路径传 matched = true，
+	// 所以 MatchedOnly 在这里不会挡。
+	targetDir := archiveTarget(cfg.Move, item, true)
+	sameName := media.SamePath(filepath.Join(item.Dir, newName), item.Path)
+
+	if cfg.DryRun {
+		landing := landingDir(targetDir, item.Dir)
+		m.update(index, func(target *Item) {
+			target.Status = StatusPreview
+			target.Attempts = attempts
+			applyTrack(target, result)
+			target.NewName = newName
+			target.NewPath = filepath.Join(landing, newName)
+			target.Message = previewMessage(targetDir, landing, newName)
+		})
+		m.bump(func(p *Progress) { p.Matched++ })
+		return
+	}
+
+	if sameName && targetDir == "" {
 		m.update(index, func(target *Item) {
 			target.Status = StatusMatched
 			target.Attempts = attempts
@@ -687,46 +1057,74 @@ func (m *Manager) finishMatched(index int, result recognizer.Result, attempts in
 		return
 	}
 
-	if cfg.DryRun {
-		m.update(index, func(target *Item) {
-			target.Status = StatusPreview
-			target.Attempts = attempts
-			applyTrack(target, result)
-			target.NewName = newName
-			target.NewPath = filepath.Join(target.Dir, newName)
-			target.Message = "预览：将重命名为 " + newName
-		})
-		m.bump(func(p *Progress) { p.Matched++ })
-		return
+	// 先改名，再搬走。两步分开的理由见 move.go 文件头。
+	newPath := item.Path
+	if !sameName {
+		path, err := m.rename(index, newName)
+		if err != nil {
+			m.update(index, func(target *Item) {
+				target.Status = StatusFailed
+				target.Attempts = attempts
+				target.Title = result.Title
+				target.Artist = result.Artist
+				target.Message = "改名失败：" + firstLine(err.Error())
+			})
+			m.bump(func(p *Progress) { p.Failed++ })
+			return
+		}
+		newPath = path
 	}
 
-	newPath, err := m.rename(index, newName)
-	if err != nil {
-		m.update(index, func(target *Item) {
-			target.Status = StatusFailed
-			target.Attempts = attempts
-			target.Title = result.Title
-			target.Artist = result.Artist
-			target.Message = "改名失败：" + firstLine(err.Error())
-		})
-		m.bump(func(p *Progress) { p.Failed++ })
-		return
+	moved := false
+	if targetDir != "" {
+		path, err := m.moveTo(newPath, targetDir)
+		if err != nil {
+			// 改名已经发生，这条还原记录必须先落下：不然这个文件既改不回原名，
+			// 也没进记录页，等于彻底脱离管理。
+			m.recordUndo(item.Path, newPath)
+			m.rememberProcessed(newPath)
+			m.update(index, func(target *Item) {
+				target.Status = StatusFailed
+				target.Attempts = attempts
+				applyTrack(target, result)
+				target.NewName = filepath.Base(newPath)
+				target.NewPath = newPath
+				target.Path = newPath
+				target.Name = filepath.Base(newPath)
+				target.Message = "已改名，但移动失败：" + firstLine(err.Error())
+			})
+			m.bump(func(p *Progress) { p.Failed++ })
+			return
+		}
+		moved = !media.SamePath(path, newPath)
+		newPath = path
 	}
 
 	m.recordUndo(item.Path, newPath)
 	m.rememberProcessed(newPath)
 
 	m.update(index, func(target *Item) {
-		target.Status = StatusRenamed
 		target.Attempts = attempts
 		applyTrack(target, result)
 		target.NewName = filepath.Base(newPath)
 		target.NewPath = newPath
 		target.Path = newPath
 		target.Name = filepath.Base(newPath)
-		target.Message = "已重命名"
+		target.Dir = filepath.Dir(newPath)
+		target.Moved = moved
+		target.Status = StatusMoved
+		switch {
+		case moved && !sameName:
+			target.Status = StatusRenamed
+			target.Message = "已重命名并移动到 " + filepath.Dir(newPath)
+		case moved:
+			target.Message = moveMessage(newPath)
+		default:
+			target.Status = StatusRenamed
+			target.Message = "已重命名"
+		}
 	})
-	m.bump(func(p *Progress) { p.Matched++; p.Renamed++ })
+	m.bump(func(p *Progress) { p.Matched++ })
 }
 
 // applyTrack 把识别到的曲目信息写到条目上。三处出口（已是对的 / 预览 / 已改名）
@@ -768,6 +1166,9 @@ func (m *Manager) finishUnmatched(index int, attempts int) {
 		naming.Fields{Original: item.Name}, cfg.MaxNameRunes, false)
 	newName := base + item.Ext
 
+	// 未识别的要不要一起搬，由 MoveRule.MatchedOnly 决定。
+	targetDir := archiveTarget(cfg.Move, item, false)
+
 	// 已经带上未识别标记的（比如上一轮留下的）就不动了，避免套娃。
 	//
 	// 判断交给 Unmatched.Marked：不能直接写 strings.HasPrefix(name, prefix)，
@@ -775,10 +1176,31 @@ func (m *Manager) finishUnmatched(index int, attempts int) {
 	// 未识别的一个都不改名了，而界面上看不出任何异常。
 	stem := strings.TrimSuffix(item.Name, item.Ext)
 	if unmatched.Marked(stem) {
+		message := "未识别（已经是未识别命名）"
+		moved := false
+		if targetDir != "" {
+			path, err := m.moveTo(item.Path, targetDir)
+			if err != nil {
+				m.update(index, func(target *Item) {
+					target.Status = StatusFailed
+					target.Attempts = attempts
+					target.Message = "移动失败：" + firstLine(err.Error())
+				})
+				m.bump(func(p *Progress) { p.Failed++ })
+				return
+			}
+			if !media.SamePath(path, item.Path) {
+				m.recordUndo(item.Path, path)
+				m.rememberProcessed(path)
+				moved = true
+				message = "未识别，已移动到 " + filepath.Dir(path)
+			}
+		}
 		m.update(index, func(target *Item) {
 			target.Status = StatusNoMatch
 			target.Attempts = attempts
-			target.Message = "未识别（已经是未识别命名）"
+			target.Moved = moved
+			target.Message = message
 		})
 		m.bump(func(p *Progress) { p.Unmatched++ })
 		return
@@ -793,7 +1215,8 @@ func (m *Manager) finishUnmatched(index int, attempts int) {
 	// 自己正占着那个名字**，于是它判定冲突，返回 `mystery (1).mp4`。
 	// 结果是一个什么都没认出来的文件被莫名加上 " (1)"，而且看起来像是正常改名。
 	// finishMatched 里也有同样的一道同名判断，理由一样。
-	if media.SamePath(filepath.Join(item.Dir, newName), item.Path) {
+	sameName := media.SamePath(filepath.Join(item.Dir, newName), item.Path)
+	if sameName && targetDir == "" {
 		m.update(index, func(target *Item) {
 			target.Status = StatusNoMatch
 			target.Attempts = attempts
@@ -804,26 +1227,53 @@ func (m *Manager) finishUnmatched(index int, attempts int) {
 	}
 
 	if cfg.DryRun {
+		landing := landingDir(targetDir, item.Dir)
 		m.update(index, func(target *Item) {
 			target.Status = StatusPreview
 			target.Attempts = attempts
 			target.NewName = newName
-			target.NewPath = filepath.Join(target.Dir, newName)
-			target.Message = "预览：未识别，将改为 " + newName
+			target.NewPath = filepath.Join(landing, newName)
+			target.Message = "预览：未识别，" + previewMessage(targetDir, landing, newName)
 		})
 		m.bump(func(p *Progress) { p.Unmatched++ })
 		return
 	}
 
-	newPath, err := m.rename(index, newName)
-	if err != nil {
-		m.update(index, func(target *Item) {
-			target.Status = StatusFailed
-			target.Attempts = attempts
-			target.Message = "改名失败：" + firstLine(err.Error())
-		})
-		m.bump(func(p *Progress) { p.Failed++ })
-		return
+	newPath := item.Path
+	if !sameName {
+		path, err := m.rename(index, newName)
+		if err != nil {
+			m.update(index, func(target *Item) {
+				target.Status = StatusFailed
+				target.Attempts = attempts
+				target.Message = "改名失败：" + firstLine(err.Error())
+			})
+			m.bump(func(p *Progress) { p.Failed++ })
+			return
+		}
+		newPath = path
+	}
+
+	moved := false
+	if targetDir != "" {
+		path, err := m.moveTo(newPath, targetDir)
+		if err != nil {
+			m.recordUndo(item.Path, newPath)
+			m.rememberProcessed(newPath)
+			m.update(index, func(target *Item) {
+				target.Status = StatusFailed
+				target.Attempts = attempts
+				target.NewName = filepath.Base(newPath)
+				target.NewPath = newPath
+				target.Path = newPath
+				target.Name = filepath.Base(newPath)
+				target.Message = "已改名，但移动失败：" + firstLine(err.Error())
+			})
+			m.bump(func(p *Progress) { p.Failed++ })
+			return
+		}
+		moved = !media.SamePath(path, newPath)
+		newPath = path
 	}
 
 	m.recordUndo(item.Path, newPath)
@@ -836,7 +1286,16 @@ func (m *Manager) finishUnmatched(index int, attempts int) {
 		target.NewPath = newPath
 		target.Path = newPath
 		target.Name = filepath.Base(newPath)
-		target.Message = "未识别，已改为 " + filepath.Base(newPath)
+		target.Dir = filepath.Dir(newPath)
+		target.Moved = moved
+		switch {
+		case moved && !sameName:
+			target.Message = "未识别，已改名为 " + filepath.Base(newPath) + " 并移动"
+		case moved:
+			target.Message = "未识别，" + moveMessage(newPath)
+		default:
+			target.Message = "未识别，已改为 " + filepath.Base(newPath)
+		}
 	})
 	m.bump(func(p *Progress) { p.Unmatched++ })
 }
@@ -893,8 +1352,16 @@ func (m *Manager) bump(mutate func(*Progress)) {
 
 // recountLocked 从列表重算进度。自增容易在重试、停止这些路径上算错，
 // 重算一遍比信任一个计数器便宜。
+//
+// 冷却截止时刻**不在**重算范围里：它不是列表的派生量，而是闸门的状态。
+// 不特意带过来的话，每有一条目更新（跑到一半时几乎每秒都有）就会把界面上的
+// 倒计时抹掉，看着像是冷却被取消了。
 func (m *Manager) recountLocked() {
-	progress := Progress{Total: len(m.items), Running: m.running}
+	progress := Progress{
+		Total:         len(m.items),
+		Running:       m.running,
+		CooldownUntil: m.progress.CooldownUntil,
+	}
 	for _, item := range m.items {
 		switch item.Status {
 		case StatusSkipped:
@@ -907,11 +1374,21 @@ func (m *Manager) recountLocked() {
 			progress.Matched++
 			progress.Renamed++
 			progress.Done++
+			if item.Moved {
+				progress.Moved++
+			}
+		case StatusMoved:
+			progress.Matched++
+			progress.Moved++
+			progress.Done++
 		case StatusNoMatch:
 			progress.Unmatched++
 			progress.Done++
 		case StatusFailed:
 			progress.Failed++
+			progress.Done++
+		case StatusRateLimited:
+			progress.RateLimited++
 			progress.Done++
 		case StatusCanceled:
 			progress.Done++

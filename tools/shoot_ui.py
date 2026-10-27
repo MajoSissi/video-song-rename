@@ -39,7 +39,7 @@ CHROME_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
-VIEWS = ["tasks", "templates", "history", "settings"]
+VIEWS = ["tasks", "naming", "history", "settings"]
 
 # 常规截图尺寸。几何探针必须用同一个值，见 view_state 的 size 参数。
 WINDOW_SIZE = "1280,880"
@@ -91,41 +91,32 @@ STUB_ITEMS = [
      "status": "pending"},
 ]
 
-STUB_TEMPLATES = [
-    {"name": "只歌名", "separator": " - ", "slots": [{"var": "title"}], "active": False},
-    {"name": "歌名 - 艺人", "separator": " - ",
-     "slots": [{"var": "title"}, {"var": "artist"}], "active": False},
-    {"name": "艺人 - 歌名", "separator": " - ",
-     "slots": [{"var": "artist"}, {"var": "title"}], "active": False},
-    # 「歌名 (年份)」：括号挂在这一格上，年份取不到时整格（含括号）消失。
-    # separator 显式写成空串，表示「不要分隔符」——和「跟随全局」是两回事。
-    {"name": "歌名 (年份)", "separator": " - ",
-     "slots": [{"var": "title"},
-               {"var": "year", "prefix": " (", "suffix": ")", "separator": ""}],
-     "active": False},
-    # 用户报的那个场景，**故意设为当前**：
-    # 截图里「缺中文歌名」那一行会显示成 "BTS - Spring Day" 而不是 "BTS - Spring Day -"，
-    # 这就是这次改动要证明的事，不摆出来截图就白截了。
-    {"name": "艺人 - 英文名 - 中文名", "separator": " - ",
-     "slots": [{"var": "artist"},
-               {"var": "title", "script": "en"},
-               {"var": "title", "script": "zh"}],
-     "active": True},
-]
+STUB_NAMING = {
+    "separator": " - ",
+    # 用户报的那个场景：中文缺失时那一格整个消失，不留分隔符。
+    # 截图里「缺中文歌名」一行显示成 "BTS - Spring Day"，这就是要证明的事。
+    "slots": [{"var": "artist"}, {"var": "title", "script": "en"}, {"var": "title", "script": "zh"}],
+    "unmatchedPrefix": "0_", "unmatchedSuffix": "", "maxNameRunes": 120,
+    # 去重是默认行为（Go 那边零值 false 就是去重）。
+    "keepDuplicates": False,
+    "move": {"enabled": True, "mode": "sibling", "dir": "", "name": "",
+             "prefix": "", "suffix": "_已整理", "matched_only": True},
+}
 
 # 变量 / 语种 / 分隔符目录。
 #
 # 不在这里再写一份：**唯一权威在 Go**（internal/naming 的 Choices / Separators），
 # 而这份 JSON 是两个静态预览桩共用的副本（另一个是 tools/preview/stub.js）。
-# frontend_contract_test.go 的 TestStubTemplateOptionsMatchGo 会逐项比对，漂移直接变红。
-TEMPLATE_OPTIONS_PATH = REPO_ROOT / "tools" / "preview" / "template-options.json"
-STUB_TEMPLATE_OPTIONS = json.loads(TEMPLATE_OPTIONS_PATH.read_text(encoding="utf-8"))
+# frontend_contract_test.go 的 TestStubNamingOptionsMatchGo 会逐项比对，漂移直接变红。
+NAMING_OPTIONS_PATH = REPO_ROOT / "tools" / "preview" / "naming-options.json"
+STUB_NAMING_OPTIONS = json.loads(NAMING_OPTIONS_PATH.read_text(encoding="utf-8"))
 
 STUB_CONFIG = {
     "segment_seconds": 12, "concurrency": 3, "retries": 2,
+    "request_interval_ms": 1500,
     "language": "en-US", "country": "GB", "timeout_seconds": 20,
     "name_template": {"separator": " - ", "slots": [{"var": "artist"}, {"var": "title"}]},
-    "templates": STUB_TEMPLATES, "active_template": "艺人 - 英文名 - 中文名",
+    "move": STUB_NAMING["move"],
     "unmatched_prefix": "0_", "unmatched_suffix": "", "max_name_runes": 120,
     "extensions": [".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".ts",
                    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma"],
@@ -240,8 +231,8 @@ window.runtime = {
 window.wails = { flags: { cssDragProperty: '--wails-draggable', cssDragValue: 'drag' } };
 
 const __items = __STUB_ITEMS__;
-const __templates = __STUB_TEMPLATES__;
-const __templateOptions = __STUB_TEMPLATE_OPTIONS__;
+const __naming = __STUB_NAMING__;
+const __namingOptions = __STUB_NAMING_OPTIONS__;
 const __config = __STUB_CONFIG__;
 const __history = __STUB_HISTORY__;
 
@@ -266,38 +257,23 @@ window.go = { main: { App: {
     proxy: proxy || '跟随环境变量（HTTP_PROXY / HTTPS_PROXY / NO_PROXY）',
     http_status: 400, elapsed_ms: 186, error: ''
   }); },
-  Templates: function () { return __ok(__templates); },
-  SaveTemplate: function (input) {
-    const found = __templates.find(function (t) { return t.name === input.name; });
-    if (found) { found.separator = input.separator; found.slots = input.slots; }
-    else __templates.push({ name: input.name, separator: input.separator, slots: input.slots, active: false });
-    return __ok(__templates);
-  },
-  SetActiveTemplate: function (name) {
-    __templates.forEach(function (t) { t.active = (t.name === name); });
-    return __ok(__templates);
-  },
-  DeleteTemplate: function (name) {
-    const i = __templates.findIndex(function (t) { return t.name === name; });
-    if (i >= 0) __templates.splice(i, 1);
-    if (!__templates.some(function (t) { return t.active; })) __templates[0].active = true;
-    return __ok(__templates);
-  },
-  RenameTemplate: function (oldName, newName) {
-    const found = __templates.find(function (t) { return t.name === oldName; });
-    if (found) found.name = newName;
-    return __ok(__templates);
-  },
-  DuplicateTemplate: function (name, newName) {
-    const found = __templates.find(function (t) { return t.name === name; });
-    if (found) {
-      __templates.push(Object.assign({}, found, { name: newName, slots: (found.slots || []).slice() }));
+  Naming: function () { return __ok(__naming); },
+  NamingOptions: function () { return __ok(__namingOptions); },
+  SaveNaming: function (input) { __naming = input; return __ok(__naming); },
+  // 归档位置的试算。桩里只按 sibling 规则拼一个给人看的路径，
+  // 真正的判断在 Go（config.MoveRule.TargetDir）。
+  PreviewMove: function (rule) {
+    if (!rule || !rule.enabled) {
+      return __ok({ dir: '', ok: false, note: '不移动，文件改名后留在原目录' });
     }
-    return __ok(__templates);
+    return __ok({
+      dir: 'D:////////Music////////' + (rule.name || 'Music') + (rule.suffix || ''),
+      ok: true,
+      note: '目录不存在会自动创建；遇到同名文件会加 (1)，不会覆盖'
+    });
   },
-  ResetTemplates: function () { return __ok(__templates); },
-  TemplateEditorOptions: function () { return __ok(__templateOptions); },
-  PreviewTemplate: function (input) {
+  PickMoveFolder: function () { return __ok('D:////////Music////////归档'); },
+  PreviewNaming: function (input) {
     // 桩里这份渲染**只为了把版式画出来**。
     // 真正的实现只有 Go 那一份（naming.Template.Render），别照这个改逻辑 ——
     // 之所以还是写了个简化版而不是返回死文本，是因为「缺中文歌名」那一行
@@ -316,13 +292,26 @@ window.go = { main: { App: {
     function render(data) {
       let out = '';
       let written = false;
+      // 判重用的键。和 Go 那边的 foldKey 同一套规则：忽略大小写、空白、标点。
+      // 只对歌名 / 艺人 / 专辑做 —— 固定文字写两遍是用户故意的。
+      function foldKey(text) {
+        return (text || '').replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase();
+      }
+      const seen = {};
       (input.slots || []).forEach(function (slot) {
         // 带语种的槽位**只**看那个语种的键，不回退到通用键。
         // 回退的话「中文歌名」槽位会拿到通用歌名，渲染出 "Spring Day - Spring Day"，
-        // 截图里看着像模板写错了 —— 真实现（naming.Slot.Value）也是不回退的。
+        // 截图里看着像规则写错了 —— 真实现（naming.Slot.Value）也是不回退的。
         const key = slot.script ? (slot.var + ':' + slot.script) : slot.var;
         const value = slot.var === 'literal' ? (slot.text || '') : (data[key] || '');
         if (!value) return;                    // 空槽整个跳过 —— 关键就在这一行
+        // 同一句话在另一个语种下又出现一次（英文歌的原版名 == 英文名）：
+        // 后出现的那一格也整格跳过，连前缀后缀和它前面那个分隔符一起。
+        if (!input.keepDuplicates && (slot.var === 'title' || slot.var === 'artist' || slot.var === 'album')) {
+          const dedupeKey = slot.var + '#' + foldKey(value);
+          if (seen[dedupeKey]) return;
+          seen[dedupeKey] = true;
+        }
         if (written) {
           const own = (slot.separator === null || slot.separator === undefined)
             ? (input.separator || ' - ') : slot.separator;
@@ -337,7 +326,7 @@ window.go = { main: { App: {
     const cases = rows.map(function (row) {
       return { label: row.label, note: row.note, text: render(row.data), empty: false };
     });
-    cases.push({ label: '完全没识别到', note: '走「未识别」前缀，模板不参与',
+    cases.push({ label: '完全没识别到', note: '走「未识别」前缀，规则不参与',
                  text: '0_VID_20240103_210455', empty: false });
     return __ok(cases);
   },
@@ -358,6 +347,15 @@ window.go = { main: { App: {
   CloseWindow: function () {}, ShowWindow: function () {}, HideWindow: function () {}, QuitApp: function () {},
   Pause: function () {}, Resume: function () {}, Stop: function () {}, Start: function () {},
   Clear: function () {}, RemoveItems: function () { return __ok(__items); },
+  // 重置：条目一个不少，只是状态回到「待处理」。
+  Reset: function () {
+    __items.forEach(function (item) {
+      item.status = 'pending';
+      item.message = ''; item.newName = ''; item.newPath = '';
+      item.attempts = 0; item.moved = false;
+    });
+    return __ok(__items.slice());
+  },
   ScanPath: function () { return __ok(__items); },
   // 还原之后让队列跟上磁盘。**不新增也不删除**，所以这里照原样回一份。
   ResyncQueue: function () { return __ok(__items); },
@@ -411,9 +409,9 @@ SWITCH_JS = """
 # 「Esc 是不是真的取消了」「点卡片里面会不会误关」。
 # 这几条都是异步的（askConfirm 返回 Promise），所以只能串成 async 序列。
 TEMPLATE_PROBE_JS = """
-// 槽位编辑器的行为断言。只在 #templates+slotprobe 时跑。
+// 槽位编辑器的行为断言。只在 #naming+slotprobe 时跑。
 //
-// 要等 boot() 跑完 —— chip 是 loadTemplates() 之后才建出来的，
+// 要等 boot() 跑完 —— chip 是 loadNaming() 之后才建出来的，
 // 而 SWITCH_JS 是同步切的视图，那时候 #slotList 里只有一个「+ 添加」。
 (function () {
   if (!location.hash.split('+').includes('slotprobe')) return;
@@ -433,27 +431,34 @@ TEMPLATE_PROBE_JS = """
     out.chips = chips().length;
     out.firstKey = keyOf(0);
 
-    // ---- 模板列表不该再标「当前」 ----
+    // ---- 模板库应当整体不存在 ----
     //
-    // 用哪一份模板是**任务页那颗下拉**现场决定的；模板页里选中的只是
-    // 「正在编辑哪一份」。列表上再挂一个「当前」小标，会让人以为
-    // 在模板页点一下就等于换了识别用的模板。
+    // 模板库删掉以后只剩一套全局命名规则，命名页左边那个「一堆可选项」的
+    // `.ws-nav` 也跟着没了 —— 留一个空左栏比没有左栏更糟，会让人以为还有
+    // 别的东西可选。这几项只要有一个不是 0，就说明旧结构又长回来了。
+    out.tplList = document.querySelectorAll('#tplList, #tplSearch, #btnNewTemplate').length;
+    out.tplNav = document.querySelectorAll('#view-naming .ws-nav').length;
     out.listBadges = document.querySelectorAll('#tplList .badge').length;
-    out.listSaysCurrent = [...document.querySelectorAll('#tplList *')]
-      .filter((n) => !n.children.length && n.textContent.trim() === '当前').length;
-    // 原来包住「名字 + 角标」的那层 .row1 也该一起没了 ——
-    // 只剩名字和一行说明之后，它就是个多余的 flex 容器。
-    out.listRow1 = document.querySelectorAll('#tplList .row1').length;
 
-    // ---- 模板页右边不该有滚动条 ----
+    // ---- 命名页右边不该有滚动条 ----
     //
-    // 这一页统共四段，正常窗口尺寸下就该一眼看全。
+    // 这一页统共五段，正常窗口尺寸下就该一眼看全。
     // 量的是 scrollHeight - clientHeight：截图那一路带着 --hide-scrollbars，
     // **永远看不到滚动条**，所以「看起来没有」不算数 ——
     // 只有这个差值是 0，才是真的装得下、而不是滚不滚得动的问题。
     //
+    // 量之前先把「归档位置」收起来。桩里它是**开着**的（截图要展示那几行控件），
+    // 而展开之后那一段有六行输入框，任何窗口都装不下 —— 那是预期，
+    // 用户点开开关本来就意味着要多填几行。这条断言守的是**默认**形态能一眼看全。
+    // 注意这里必须真的派发 change：收起是 onchange 里做的，只改 checked 不动布局。
+    const moveBox = document.getElementById('moveEnabled');
+    if (moveBox && moveBox.checked) {
+      moveBox.checked = false;
+      moveBox.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    //
     // 必须在开头量：下面会反复增删槽位，那时候的布局已经不是默认那份模板了。
-    const scroller = document.getElementById('tplScroll');
+    const scroller = document.getElementById('namingScroll');
     out.scrollOver = scroller ? scroller.scrollHeight - scroller.clientHeight : -1;
     const prev = document.getElementById('tplPreview');
     out.previewOver = prev ? prev.scrollHeight - prev.clientHeight : -1;
@@ -1061,213 +1066,9 @@ PAGER_PROBE_JS = """
 """.replace("__BASE_TS__", str(PAGER_BASE_TS))
 
 
-# 这里原来有个 SLOT_OPEN_JS，用来把某一格的补充设置「点开」再截图。
-# 字段现在常驻（一行一段竖着排），没有展开这个状态，拿 #templates 直接截就行。
-
-# 字段现在常驻（一行一段竖着排），没有展开这个状态，拿 #templates 直接截就行。
-
-
-MENU_PROBE_JS = """
-// 模板列表的右键菜单。只在 #templates+menuprobe 时跑。
-//
-// 名称的改动（重命名 / 复制 / 删除）现在**只**挂在这份右键菜单上 ——
-// 页面上那个「名称」输入框和底栏那两颗按钮都删掉了。所以这条路径一旦断了，
-// 改名这件事就完全没有入口，而它断掉的样子是「右键没反应」，
-// 不抛错、不写日志，只有手动点才会发现。
-//
-// 这里刻意走完整条链：右键 → 菜单 → 弹窗填字 → 后端 → 列表重画。
-// 只断言「菜单弹出来了」是不够的：真正的风险在弹窗和后端那两步。
-(async function () {
-  if (!location.hash.split('+').includes('menuprobe')) return;
-
-  // 等 boot()：列表是 loadTemplates() 之后才画出来的。
-  for (let i = 0; i < 400 && document.documentElement.dataset.boot !== 'done'; i++) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
-
-  const out = {};
-  const items = () => document.querySelectorAll('#tplList .tpl-item');
-  // 容器是 HTML 里预置的，所以「弹出来了吗」要看它是不是被藏着，
-  // 不能看它在不在 —— 它一直在。
-  const menu = () => {
-    const node = document.getElementById('ctxMenu');
-    return node && !node.classList.contains('hidden') ? node : null;
-  };
-  const entries = () => (menu() ? [...menu().querySelectorAll('button')] : []);
-  const names = () => [...items()].map((n) => n.querySelector('b').textContent.trim());
-  const current = () => {
-    const on = document.querySelector('#tplList .tpl-item.on b');
-    return on ? on.textContent.trim() : '';
-  };
-  const openOn = (index) => {
-    items()[index].dispatchEvent(new MouseEvent('contextmenu', {
-      bubbles: true, cancelable: true, clientX: 40, clientY: 120,
-    }));
-  };
-  const pick = (label) => entries().find((b) => b.textContent === label).click();
-
-  // 推进异步链**只能刷微任务，不能用 setTimeout**。
-  //
-  // 无头 Chrome 的 --dump-dom 在 load 事件一触发就把 DOM 拍下来，
-  // 之后定时器不再推进。探针开头那个等 boot 的循环能用 setTimeout，
-  // 是因为那时页面还在解析、load 还没来；一旦走到这一句之后再用，
-  // 后续步骤就永远跑不到 —— 表现是「属性没写上去」，看着像脚本报错。
-  // 桩里每个方法都返回已经 resolve 的 Promise，所以刷微任务就够了。
-  const flush = async (done) => {
-    for (let i = 0; i < 200; i++) {
-      if (done && done()) return;
-      await Promise.resolve();
-    }
-  };
-
-  out.items = items().length;
-  out.namesBefore = names().join(' | ');
-
-  // ---- 菜单本身 ----
-  openOn(1);
-  out.menuShown = !!menu();
-  out.labels = entries().map((b) => b.textContent).join(' | ');
-  // 右键顺手选中那一份：菜单里三项都是对着它做的，
-  // 而右键落在没选中的那一份上时，用户多半以为已经选上了。
-  out.selectedIsRightClicked = items()[1].classList.contains('on');
-  out.deleteEnabled = entries().some((b) => b.textContent === '删除' && !b.disabled);
-  // 菜单不能被窗口裁掉：点最下面一行时它得往上翻，否则看不见的那几项等于没有。
-  const rect = menu().getBoundingClientRect();
-  out.menuInsideViewport =
-    rect.left >= 0 && rect.top >= 0
-    && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
-
-  // 点别处 / Esc 都要收起。收不起来的话它就一直挂在最上层，
-  // 挡住底下的按钮 —— 而用户以为自己只是点了一下空白。
-  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-  out.closedByOutsideClick = !menu();
-  openOn(1);
-  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
-  out.closedByEscape = !menu();
-
-  // ---- 重命名 ----
-  openOn(1);
-  const original = names()[1];
-  pick('重命名');
-  const input = document.getElementById('modalInput');
-  out.renameDialogShown =
-    !document.getElementById('modalField').classList.contains('hidden')
-    && !document.getElementById('modalMask').classList.contains('hidden');
-  out.renamePrefill = input.value;
-  out.renameFocusIsInput = document.activeElement === input;
-
-  input.value = '改过名的模板';
-  document.getElementById('modalOk').click();
-  await flush(() => names().indexOf('改过名的模板') >= 0);
-  out.namesAfterRename = names().join(' | ');
-  // 改名字，不是「存一份新的再删旧的」—— 位置和条数都不该变。
-  out.renamedInPlace = items().length === out.items && names().indexOf(original) < 0;
-  // 编辑器要跟着换过去。不换的话 editing 指向一个不存在的名字：
-  // 底栏一直写「有未保存的改动」，按「保存」会把旧名字重新创建出来 ——
-  // 用户以为改了名，结果是多了一份。
-  out.editingFollowedRename = current() === '改过名的模板';
-
-  // ---- 复制 ----
-  openOn(0);
-  const countBefore = items().length;
-  pick('复制');
-  out.dupPrefill = input.value;
-  document.getElementById('modalOk').click();
-  await flush(() => items().length !== countBefore);
-  out.dupAdded = items().length - countBefore;
-  out.dupNames = names().join(' | ');
-  // 复制完切到新的那一份：复制多半就是为了改它，
-  // 留在原地的话用户还得回列表里找一遍。
-  out.dupSelected = current() === out.dupPrefill;
-
-  // ---- 删除 ----
-  const countBeforeDelete = items().length;
-  openOn(items().length - 1);
-  pick('删除');
-  await flush();
-  // 删东西必须过一道确认框。不过的话右键一滑就少一份模板，没有回头路。
-  out.deleteConfirmShown = !document.getElementById('modalMask').classList.contains('hidden');
-  document.getElementById('modalOk').click();
-  await flush(() => items().length !== countBeforeDelete);
-  out.deleteRemoved = countBeforeDelete - items().length;
-
-  // ---- 只剩一份时「删除」要置灰 ----
-  for (let guard = 0; guard < 20 && items().length > 1; guard++) {
-    const n = items().length;
-    openOn(0);
-    pick('删除');
-    await flush();
-    document.getElementById('modalOk').click();
-    await flush(() => items().length !== n);
-  }
-  out.itemsAtEnd = items().length;
-  openOn(0);
-  // 后端也会拒绝删最后一份，但「按下去才报错」不如一开始就是灰的。
-  out.deleteDisabledOnLast =
-    entries().some((b) => b.textContent === '删除' && b.disabled);
-  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-
-  document.documentElement.setAttribute('data-menu-probe', JSON.stringify(out));
-})();
-"""
-
-
-MENU_SHOT_JS = """
-// 只为了截图：把模板列表的右键菜单弹出来。只在 #templates+ctxmenu 时跑。
-//
-// 菜单只在右键时出现，而截图脚本没法「右键」—— 不专门弹一次的话，
-// 这块新 UI 从没被看见过，配色和边距只能靠想象。
-//
-// 这里**必须刷微任务，不能等 setTimeout**。截图在 load 事件一触发就拍下了
-// （同 SWITCH_JS 那条注释），而 setTimeout 排在 load 后面 —— 菜单还没弹出来
-// 图就拍完了，表现是「截图里干干净净、也没有报错」，看着像菜单没做出来。
-// 桩里每个方法都返回已经 resolve 的 Promise，所以 boot() 整条链都是微任务，
-// 刷微任务就能赶在 load 之前跑完。
-(async function () {
-  if (!location.hash.split('+').includes('ctxmenu')) return;
-
-  const ready = () => document.documentElement.dataset.boot === 'done'
-    && document.querySelectorAll('#tplList .tpl-item').length > 1;
-  for (let i = 0; i < 400 && !ready(); i++) await Promise.resolve();
-  if (!ready()) return;
-
-  const items = document.querySelectorAll('#tplList .tpl-item');
-  // 点在行自己的位置附近，这样截图里的相对位置和真机上一样。
-  const rect = items[1].getBoundingClientRect();
-  items[1].dispatchEvent(new MouseEvent('contextmenu', {
-    bubbles: true, cancelable: true,
-    clientX: Math.round(rect.left + 70), clientY: Math.round(rect.bottom),
-  }));
-
-  // 菜单已经在 DOM 里了，但 --screenshot 拍不到它 —— 那一帧就是不画这个
-  // 刚建出来的浮层（元素有布局、getBoundingClientRect 正常、命中测试也正常）。
-  //
-  // 这不是菜单做错了：拿 CDP 的 Page.captureScreenshot 拍同一个页面，
-  // 菜单显示得好好的（临时脚本比对过）。也排除了「没弹出来」「弹出来又被关掉」
-  // 「被别的元素盖住」这几种可能 —— 逐条验证的经过见下面这段的对照实验：
-  //   预置容器 vs 每次新建、去 focus、去夹边、改 z-index/阴影/display/position、
-  //   强制重绘、--headless=new、--run-all-compositor-stages-before-draw，
-  //   都拍不到；而**新插入**的元素画得出来。
-  //
-  // 所以这里把菜单原样搬一份到新元素上再收掉原件：class、内容、位置完全一样，
-  // 图里看到的就是真菜单的样子。行为对不对由 menuprobe 那条断言保证，
-  // 不靠这张图。
-  const menu = document.getElementById('ctxMenu');
-  if (menu) {
-    const shell = menu.cloneNode(true);
-    shell.removeAttribute('id');
-    shell.style.left = menu.style.left;
-    shell.style.top = menu.style.top;
-    menu.remove();
-    document.body.appendChild(shell);
-  }
-})();
-"""
-
-
 SLOTFOCUS_SHOT_JS = """
 // 只为了截图：把命名区第 2 段的某个控件点着，好看清「这一段被选中」长什么样。
-// 只在 #templates+slotfocus 时跑。
+// 只在 #naming+slotfocus 时跑。
 //
 // 为什么必须单独截一张：选中态是**交互之后才有**的，静态截图里永远看不到它。
 // 而这正是用户报的那个毛病（「块选中时样式有问题」）—— 修完了没人看得见，
@@ -1370,7 +1171,7 @@ SCROLLBAR_PROBE_JS = """
 // 它不像界面的一部分，像界面里嵌了另一个程序。所以量的是「有没有换成自己画的」：
 // 条宽、滑块颜色、圆角、轨道透明，四条一起对上才算数。
 //
-// 同时守**反方向**：模板页的 #tplScroll 和预览框 .preview 是**故意**把滚动条
+// 同时守**反方向**：模板页的 #namingScroll 和预览框 .preview 是**故意**把滚动条
 // 藏掉的（那一页要一屏看得全，见那边的 CSS 注释）。全局那套一旦写得不够具体
 // （比如挂到 * 上），就会把它们一起变回 10px —— 那两条断言就是防这个的。
 (function () {
@@ -1397,11 +1198,11 @@ SCROLLBAR_PROBE_JS = """
 
     // 那两处要切到模板页再量。切视图是同步的（只切 .hidden），切完立刻能读。
     const nav = [...document.querySelectorAll('.nav')]
-      .find((n) => n.dataset.view === 'templates');
+      .find((n) => n.dataset.view === 'naming');
     if (nav) nav.onclick();
 
-    out.tplScroll = probe(document.getElementById('tplScroll'));
-    out.preview = probe(document.querySelector('#view-templates .preview'));
+    out.namingScroll = probe(document.getElementById('namingScroll'));
+    out.preview = probe(document.querySelector('#view-naming .preview'));
     document.documentElement.setAttribute('data-scrollbar-probe', JSON.stringify(out));
   })();
 })();
@@ -1501,7 +1302,7 @@ NUMBER_PROBE_JS = """
 
 
 SELECT_PROBE_JS = """
-// 下拉框弹出列表的配色。只在 #templates+selectprobe 时跑。
+// 下拉框弹出列表的配色。只在 #naming+selectprobe 时跑。
 //
 // 踩过的坑：Chromium 画选项列表时，列表底色是从 select 自己的
 // background-color 推的。select 写成 transparent 就推不出颜色，于是退回
@@ -1684,8 +1485,8 @@ def build_preview(dest: pathlib.Path, items: list | None = None,
 
     stub = STUB_JS
     stub = stub.replace("__STUB_ITEMS__", json.dumps(STUB_ITEMS if items is None else items, ensure_ascii=False))
-    stub = stub.replace("__STUB_TEMPLATES__", json.dumps(STUB_TEMPLATES, ensure_ascii=False))
-    stub = stub.replace("__STUB_TEMPLATE_OPTIONS__", json.dumps(STUB_TEMPLATE_OPTIONS, ensure_ascii=False))
+    stub = stub.replace("__STUB_NAMING__", json.dumps(STUB_NAMING, ensure_ascii=False))
+    stub = stub.replace("__STUB_NAMING_OPTIONS__", json.dumps(STUB_NAMING_OPTIONS, ensure_ascii=False))
     stub = stub.replace("__STUB_CONFIG__", json.dumps(STUB_CONFIG, ensure_ascii=False))
     stub = stub.replace("__STUB_HISTORY__",
                         json.dumps(STUB_HISTORY if history is None else history, ensure_ascii=False))
@@ -2039,15 +1840,15 @@ def check_slots(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str
             probe.get("ringRestored") is True,
             "焦点移走之后第 2 格的边框没恢复（还是 %s）" % probe.get("ringLit"),
         ),
-        # ---- 模板列表不该再标「当前」 ----
+        # ---- 模板库应当整体不存在 ----
         (
-            probe.get("listBadges") == 0
-            and probe.get("listSaysCurrent") == 0
-            and probe.get("listRow1") == 0,
-            "模板列表上还挂着「当前」小标（.badge %s 个 / 写着「当前」的文字 %s 处 / "
-            ".row1 容器 %s 个）—— 用哪一份模板由任务页那颗下拉决定，"
-            "列表不该再标一个「当前」"
-            % (probe.get("listBadges"), probe.get("listSaysCurrent"), probe.get("listRow1")),
+            probe.get("tplList") == 0
+            and probe.get("tplNav") == 0
+            and probe.get("listBadges") == 0,
+            "模板库的结构又长回来了（#tplList/#tplSearch/#btnNewTemplate %s 个 / "
+            "命名页左栏 %s 个 / .badge %s 个）—— 只剩一套全局命名规则，"
+            "没有列表可选，也没有「当前」这回事"
+            % (probe.get("tplList"), probe.get("tplNav"), probe.get("listBadges")),
         ),
         # ---- 模板页右边不该有滚动条 ----
         (
@@ -2192,7 +1993,7 @@ def check_scrollbars(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool
     所以读的是 ::-webkit-scrollbar 那几个伪元素的计算值。Chromium 支持给
     getComputedStyle 传伪元素名，读到的就是 CSS 里写的值（实测过）。
 
-    另外守反方向：模板页的 #tplScroll 和 .preview 是故意藏掉滚动条的，
+    另外守反方向：模板页的 #namingScroll 和 .preview 是故意藏掉滚动条的，
     全局那套一旦写得不够具体就会把它们一起变回来。
     """
     result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
@@ -2234,7 +2035,7 @@ def check_scrollbars(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool
         if not ok:
             return False, reason
 
-    for name, label in (("tplScroll", "模板页的滚动区"), ("preview", "模板页的预览框")):
+    for name, label in (("namingScroll", "模板页的滚动区"), ("preview", "模板页的预览框")):
         item = probe.get(name)
         if not item:
             return False, f"没量到{label}（{name}）—— 选择器变了？"
@@ -2243,115 +2044,6 @@ def check_scrollbars(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool
                 f"{label}（{name}）又出滚动条了（宽 {item.get('width')}）—— "
                 "那一页要一屏看得全，全局那套滚动条样式别把它一起盖住"
             )
-    return True, ""
-
-
-def check_tpl_menu(chrome: str, profile: pathlib.Path, url: str) -> tuple[bool, str]:
-    """模板列表右键菜单的重命名 / 复制 / 删除。
-
-    名称的改动现在**只**挂在这份菜单上（页面上那个「名称」输入框和底栏那两颗
-    按钮都撤掉了）。所以这条路径断了，改名就完全没有入口 —— 而它断掉的样子是
-    「右键没反应」，不抛错、不写日志，只有手动点才会发现。
-
-    断言刻意走完整条链：右键 → 菜单 → 弹窗填字 → 后端 → 列表重画。
-    只验「菜单弹出来了」不够，真正的风险在弹窗和后端那两步。
-    """
-    result = run_chrome(chrome, profile, ["--dump-dom", f"--window-size={WINDOW_SIZE}"], url)
-    dom = result.stdout or ""
-
-    match = re.search(r'data-menu-probe="([^"]*)"', dom)
-    if not match:
-        return False, "右键菜单探针没跑完（脚本报错？boot 没结束？）"
-
-    raw = match.group(1).replace("&quot;", '"')
-    try:
-        probe = json.loads(raw)
-    except json.JSONDecodeError as error:
-        return False, f"探针输出不是 JSON：{error} —— {raw[:120]}"
-
-    checks = [
-        (
-            probe.get("menuShown") is True and probe.get("labels") == "重命名 | 复制 | 删除",
-            "右键之后菜单里应当恰好是「重命名 | 复制 | 删除」，实际 %r（弹出来=%s）"
-            % (probe.get("labels"), probe.get("menuShown")),
-        ),
-        (
-            probe.get("selectedIsRightClicked") is True,
-            "右键没有顺手选中那一份 —— 菜单里的三项都是对着它做的，"
-            "用户会以为已经选上了",
-        ),
-        (
-            probe.get("menuInsideViewport") is True,
-            "菜单被窗口裁掉了一部分 —— 它在最上层又没有滚动条，"
-            "看不见的那几项等于不存在",
-        ),
-        (
-            probe.get("deleteEnabled") is True,
-            "还有好几份模板时「删除」就该是可用的",
-        ),
-        (
-            probe.get("closedByOutsideClick") is True,
-            "点菜单外面没收起来 —— 它会一直挡着底下的按钮，"
-            "而用户以为自己只是点了一下空白",
-        ),
-        (
-            probe.get("closedByEscape") is True,
-            "按 Esc 没收起来菜单",
-        ),
-        # ---- 重命名 ----
-        (
-            probe.get("renameDialogShown") is True
-            and probe.get("renameFocusIsInput") is True,
-            "点「重命名」之后要弹一个输入框、焦点落在输入框里（弹窗=%s，焦点=%s）"
-            % (probe.get("renameDialogShown"), probe.get("renameFocusIsInput")),
-        ),
-        (
-            probe.get("renamePrefill") == "歌名 - 艺人",
-            "重命名弹窗里应当预填原名（第 2 份是「歌名 - 艺人」），实际 %r"
-            % probe.get("renamePrefill"),
-        ),
-        (
-            probe.get("renamedInPlace") is True
-            and probe.get("namesAfterRename", "").find("改过名的模板") >= 0,
-            "重命名应当**就地**改名：条数和位置都不变，旧名字消失。实际 %r"
-            % probe.get("namesAfterRename"),
-        ),
-        (
-            probe.get("editingFollowedRename") is True,
-            "改名之后编辑器没跟着换过去 —— editing 指向一个不存在的名字，"
-            "底栏会一直写「有未保存的改动」，按「保存」会把旧名字重新创建出来",
-        ),
-        # ---- 复制 ----
-        (
-            probe.get("dupAdded") == 1 and probe.get("dupPrefill") == "只歌名 副本",
-            "复制应当正好多出一份、默认名字是「原名 副本」，实际多了 %s 份（预填 %r）"
-            % (probe.get("dupAdded"), probe.get("dupPrefill")),
-        ),
-        (
-            probe.get("dupSelected") is True,
-            "复制完没切到新的那一份 —— 复制多半就是为了改它，"
-            "留在原地用户还得回列表里找一遍",
-        ),
-        # ---- 删除 ----
-        (
-            probe.get("deleteConfirmShown") is True,
-            "删除没过确认框 —— 右键一滑就少一份模板，没有回头路",
-        ),
-        (
-            probe.get("deleteRemoved") == 1,
-            "确认删除之后应当正好少一份，实际少了 %s 份" % probe.get("deleteRemoved"),
-        ),
-        (
-            probe.get("itemsAtEnd") == 1 and probe.get("deleteDisabledOnLast") is True,
-            "删到最后一份时「删除」应当置灰（后端也会拒绝，但按下去才报错不如"
-            "一开始就是灰的）。实际剩 %s 份、置灰=%s"
-            % (probe.get("itemsAtEnd"), probe.get("deleteDisabledOnLast")),
-        ),
-    ]
-
-    for ok, message in checks:
-        if not ok:
-            return False, message
     return True, ""
 
 
@@ -3245,7 +2937,7 @@ def main() -> int:
         print("  ✅ 数字输入框   − / + 全换上、真的加 1、到顶到底会置灰")
 
     # 下拉框弹出列表的配色。弹出列表抓不到，所以钉住它的因（select 不能透明）。
-    ok, reason = check_selects(chrome, profile, f"{base}#templates+selectprobe")
+    ok, reason = check_selects(chrome, profile, f"{base}#naming+selectprobe")
     if not ok:
         failures.append("下拉框")
         print(f"  ❌ 下拉框      {reason}")
@@ -3253,21 +2945,12 @@ def main() -> int:
         print("  ✅ 下拉框      没有透明的 select（弹出列表会跟着变深）")
 
     # 槽位编辑器的行为探针。跑一次 Chrome，不改动截图。
-    ok, reason = check_slots(chrome, profile, f"{base}#templates+slotprobe")
+    ok, reason = check_slots(chrome, profile, f"{base}#naming+slotprobe")
     if not ok:
         failures.append("slots")
         print(f"  ❌ 槽位编辑器  {reason}")
     else:
         print("  ✅ 槽位编辑器   一行一段竖排 / 字段常驻 / 换位删除 / 焦点在整行 / 预览行数都对")
-
-    # 模板列表的右键菜单：重命名 / 复制 / 删除。
-    # 名称现在**只**能从这儿改，所以这条路断了就没有改名的入口。
-    ok, reason = check_tpl_menu(chrome, profile, f"{base}#templates+menuprobe")
-    if not ok:
-        failures.append("模板菜单")
-        print(f"  ❌ 模板菜单    {reason}")
-    else:
-        print("  ✅ 模板菜单    右键选中 / 重命名就地改 / 复制切过去 / 删除要确认 / 最后一份置灰")
 
     # 拖放遮罩只认文件。用户报过「拖文本也会显示松开鼠标加进队列」。
     ok, reason = check_drag(chrome, profile, f"{base}#tasks+dragprobe")
@@ -3345,27 +3028,9 @@ def main() -> int:
         print("  ❌ 记录勾选态 截图没产出，或与 %s 相同（没真的勾上）"
               % digests.get(digest, "?"))
 
-    # 这里原来还有一张「模板-展开某一段」的截图。
-    # 补充设置现在常驻（一行一段竖着排），没有「展开」这个状态，
-    # 上面那张 界面-templates.png 截到的就是全貌，再单独截一张是同一张图。
-
-    # 右键菜单单独截一张：它只在右键时出现，截图脚本没法「右键」——
-    # 不专门弹一次的话，这块新 UI 从没被看见过。
-    menu_shot = stage / "shot-ctxmenu.png"
-    run_chrome(
-        chrome, profile,
-        [f"--window-size={WINDOW_SIZE}", f"--screenshot={menu_shot}"],
-        f"{base}#templates+ctxmenu",
-    )
-    digest = hashlib.md5(menu_shot.read_bytes()).hexdigest()[:12] if menu_shot.is_file() else ""
-    if menu_shot.is_file() and menu_shot.stat().st_size > 2000 and digest not in digests:
-        target = out_dir / "界面-模板-右键菜单.png"
-        shutil.copyfile(menu_shot, target)
-        print(f"  ✅ 模板右键菜单 → {target}  ({menu_shot.stat().st_size} 字节, {digest})")
-    else:
-        failures.append("ctxmenu")
-        print("  ❌ 模板右键菜单 截图没产出，或与 %s 相同（菜单没弹出来）"
-              % digests.get(digest, "?"))
+    # 这里原来还有两张截图：一张「模板-展开某一段」，一张「模板-右键菜单」。
+    # 前者在补充设置改成常驻（一行一段竖着排）时就没意义了；
+    # 后者跟着模板库一起删掉了 —— 只剩一套全局命名规则，没有列表可以右键。
 
     # 「这一段被选中」单独截一张。选中态是**交互之后才有**的，静态截图里看不到它，
     # 而这一轮改的正是它（用户报「命名那边的块选中时样式有问题」）。
@@ -3374,7 +3039,7 @@ def main() -> int:
     run_chrome(
         chrome, profile,
         [f"--window-size={WINDOW_SIZE}", f"--screenshot={focus_shot}"],
-        f"{base}#templates+slotfocus",
+        f"{base}#naming+slotfocus",
     )
     digest = hashlib.md5(focus_shot.read_bytes()).hexdigest()[:12] if focus_shot.is_file() else ""
     if focus_shot.is_file() and focus_shot.stat().st_size > 2000 and digest not in digests:

@@ -54,10 +54,17 @@ type Result struct {
 	TrackKey  string `json:"track_key"`
 	// Titles / Artists 是同一首歌在不同 storefront 下的写法。
 	// 只有配了额外语种才会有多于一项，否则就是主标题自己一个。
-	Titles    []string `json:"titles"`
-	Artists   []string `json:"artists"`
-	Error     string   `json:"error"`
-	Retryable bool     `json:"retryable"`
+	Titles  []string `json:"titles"`
+	Artists []string `json:"artists"`
+	Error   string   `json:"error"`
+	// Retryable 表示这个错误重试有意义。
+	Retryable bool `json:"retryable"`
+	// RateLimited 表示**这次拿到了曲目**，但同一次调用里后续的额外语种请求
+	// 被 429 挡了下来。文件本身算成功，可这条 IP 已经被盯上了 ——
+	// 编排层要凭它让整条流水线立刻慢下来。
+	RateLimited bool `json:"rate_limited"`
+	// RetryAfter 是 429 应答里 Retry-After 的值（秒）。0 表示没有这个头。
+	RetryAfter int `json:"retry_after"`
 }
 
 // Matched 报告这次识别是否拿到了曲目。
@@ -78,6 +85,11 @@ type Options struct {
 	Proxy string
 	// Locales 是额外查询的「语言/国家」组合，每项一次完整的接口调用。
 	Locales []string
+	// RequestIntervalMS 是两次请求之间的最小间隔，透传给 sidecar，
+	// 由它在自己那几次额外语种调用之间也遵守同一个节奏。
+	// 不传下去的话，一个文件配了三个语种就是四次请求零间隔齐射 —— 编排层
+	// 能节流的只有「文件之间」，文件内部那几次它看不见。
+	RequestIntervalMS int
 }
 
 // Environment 是 sidecar 报告的运行环境。
@@ -294,6 +306,9 @@ func buildArgs(opts Options) []string {
 			args = append(args, "--locale", locale)
 		}
 	}
+	if opts.RequestIntervalMS > 0 {
+		args = append(args, "--min-interval", fmt.Sprintf("%d", opts.RequestIntervalMS))
+	}
 	return args
 }
 
@@ -360,11 +375,11 @@ func (r *Recognizer) Recognize(ctx context.Context, opts Options) (Result, error
 
 // RetryPlan 给出某个错误该等多久重试。空切片表示不该重试。
 //
-// 429 的退避必须明显大于网络抖动：重试越快，限流窗口越难过去。
+// **429 不在这里**。限流是按 IP 算的，重试是全局的事：什么时候能再发，
+// 得由所有 worker 共用的那个闸门说了算（internal/pace），而不是让每个文件
+// 各自睡 5 秒再撞一次 —— 那正是把封禁拖长的做法。
 func RetryPlan(status Status) []time.Duration {
 	switch status {
-	case StatusRateLimited:
-		return []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
 	case StatusNetwork, StatusUpstream:
 		return []time.Duration{1 * time.Second, 3 * time.Second, 8 * time.Second}
 	default:

@@ -256,16 +256,16 @@ func TestBottomPanelHasNoTopBorder(t *testing.T) {
 	}
 }
 
-// TestFrontendDoesNotHardcodeTemplateOptions 守住「变量目录只有 Go 那一份」。
+// TestFrontendDoesNotHardcodeNamingOptions 守住「变量目录只有 Go 那一份」。
 //
 // 老实现是前后端各写一份分隔符清单，靠一个比对测试钉住它们一致。
-// 现在改成界面**从后端取**（TemplateEditorOptions），前端那份清单已经删掉了 ——
-// 复制没了，就不需要那个测试了。这条测试守的是「别再写回去」。
+// 现在改成界面**从后端取**（NamingOptions），前端那份清单已经删掉了 ——
+// 复制没了，就不需要那个测试了。这条守的是「别再写回去」。
 //
 // 为什么这件事重要：变量名是前后端之间的字符串约定，
 // `{title:zh}` 在前端写成 `{title:cn}` 不会有任何编译错误，
 // 只会在用户点保存之后才悄悄出错。
-func TestFrontendDoesNotHardcodeTemplateOptions(t *testing.T) {
+func TestFrontendDoesNotHardcodeNamingOptions(t *testing.T) {
 	html, js := readFrontend(t)
 
 	// 变量名只该出现在注释里（解释渲染规则时），不该出现在可执行代码里。
@@ -275,32 +275,70 @@ func TestFrontendDoesNotHardcodeTemplateOptions(t *testing.T) {
 		`const SCRIPTS = [`,
 	} {
 		if strings.Contains(js, forbidden) {
-			t.Errorf("index.html 里又出现了 %s —— 变量目录应当从 TemplateEditorOptions 取", forbidden)
+			t.Errorf("index.html 里又出现了 %s —— 变量目录应当从 NamingOptions 取", forbidden)
 		}
 	}
 
 	// 分隔符快捷按钮撤掉之后，两边都不该再有那份符号清单。
-	// 守两件事：前端别自己写一份回来；页面里也别再长出那一排按钮。
 	if strings.Contains(js, `'-', '_', '.'`) || strings.Contains(js, `"-", "_", "."`) {
 		t.Error("index.html 里又硬编码了分隔符候选")
 	}
 	if strings.Contains(html, `id="sepPicks"`) {
-		t.Error("模板页又长出了分隔符快捷按钮（sepPicks）—— 那一排已经撤掉了")
+		t.Error("命名页又长出了分隔符快捷按钮（sepPicks）—— 那一排已经撤掉了")
 	}
 
 	// 反向确认：页面确实在用后端给的那份。
-	if !strings.Contains(js, "TemplateEditorOptions()") {
-		t.Error("index.html 没有调用 TemplateEditorOptions()，变量目录从哪来？")
+	if !strings.Contains(js, "NamingOptions()") {
+		t.Error("index.html 没有调用 NamingOptions()，变量目录从哪来？")
 	}
 
 	// 槽位编辑器要真的在页面上，不能被换回一个文本框。
 	for _, want := range []string{`id="slotList"`, `id="btnAddSlot"`, `id="tplSep"`} {
 		if !strings.Contains(html, want) {
-			t.Errorf("模板页里找不到 %s —— 槽位编辑器结构变了", want)
+			t.Errorf("命名页里找不到 %s —— 槽位编辑器结构变了", want)
 		}
 	}
 	if strings.Contains(html, `id="tplBody"`) {
-		t.Error("模板页里又出现了 tplBody 输入框 —— 已经改成槽位编辑了")
+		t.Error("命名页里又出现了 tplBody 输入框 —— 已经改成槽位编辑了")
+	}
+}
+
+// TestTemplateLibraryIsGone 守住「不提供多份模板」这条产品决定。
+//
+// 模板库删干净之后，界面上不该再出现：左栏那份列表、任务页的模板下拉、
+// 右键菜单里的重命名 / 复制 / 删除。少删一处，用户就会看到两套互相打架的
+// 「命名」入口 —— 而真正生效的只有全局那一份。
+func TestTemplateLibraryIsGone(t *testing.T) {
+	html, js := readFrontend(t)
+
+	for _, gone := range []string{
+		`id="tplList"`,        // 左栏模板列表
+		`id="btnNewTemplate"`, // 新建模板
+		`id="tplSearch"`,      // 搜模板
+		`id="selTemplate"`,    // 任务页的模板下拉
+		`id="view-templates"`, // 整块视图
+	} {
+		if strings.Contains(html, gone) {
+			t.Errorf("模板库已经删了，页面里还留着 %s", gone)
+		}
+	}
+
+	for _, gone := range []string{
+		"App.Templates(", "App.SaveTemplate(", "App.DeleteTemplate(",
+		"App.RenameTemplate(", "App.DuplicateTemplate(", "App.SetActiveTemplate(",
+		"App.ResetTemplates(", "App.PreviewTemplate(", "App.TemplateEditorOptions(",
+	} {
+		if strings.Contains(js, gone) {
+			t.Errorf("前端还在调 %s —— 这些方法已经不存在了", gone)
+		}
+	}
+
+	// 导航上那一项还在，只是换了名字。
+	if !strings.Contains(html, `data-view="naming"`) {
+		t.Error("导航里找不到「命名」这一项")
+	}
+	if !strings.Contains(html, "<span>命名</span>") {
+		t.Error("导航项的文字应当叫「命名」")
 	}
 }
 
@@ -342,14 +380,14 @@ func TestProxyDirectButtonIsNotBlank(t *testing.T) {
 	}
 }
 
-// TestStubTemplateOptionsMatchGo 守住预览桩的槽位目录和后端一致。
+// TestStubNamingOptionsMatchGo 守住预览桩的槽位目录和后端一致。
 //
 // 桩是**不得不**复制一份的：静态预览页面跑在浏览器里，没有 Go 运行时。
-// 既然复制躲不掉，就让两份桩共用**同一个** JSON（tools/preview/template-options.json），
+// 既然复制躲不掉，就让两份桩共用**同一个** JSON（tools/preview/naming-options.json），
 // 并由这条测试逐项比对 —— 否则桩会慢慢漂移，
 // 预览页面看着正常、真机上却是另一套变量名，而截图又正是靠桩生成的。
-func TestStubTemplateOptionsMatchGo(t *testing.T) {
-	const path = "tools/preview/template-options.json"
+func TestStubNamingOptionsMatchGo(t *testing.T) {
+	const path = "tools/preview/naming-options.json"
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
